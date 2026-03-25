@@ -16,44 +16,29 @@ jobs:
       matrix:
         pg_version: [18, 17, 16]
 
-    services:
-      postgres:
-        image: postgres:${{ matrix.pg_version }}
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: pgaudix_test
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+    container:
+      image: postgres:${{ matrix.pg_version }}
+      env:
+        POSTGRES_HOST_AUTH_METHOD: trust
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL dev headers
+      - name: Install build dependencies
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
-          sudo apt-get update
-          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }}
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-${{ matrix.pg_version }}
 
-      - name: Build extension
-        run: make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
+      - name: Build and install extension
+        run: make USE_PGXS=1 && make USE_PGXS=1 install
 
-      - name: Install extension
-        run: sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config install
-
-      - name: Run regression tests
-        run: make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config installcheck PGUSER=postgres PGHOST=localhost PGPORT=5432 PGDATABASE=pgaudix_test
-        env:
-          PGPASSWORD: postgres
+      - name: Start PostgreSQL and run tests
+        run: |
+          su postgres -c "pg_ctl -D /tmp/pgdata initdb"
+          su postgres -c "pg_ctl -D /tmp/pgdata -l /tmp/pg.log start"
+          su postgres -c "make USE_PGXS=1 installcheck"
 
       - name: Show test diff on failure
         if: failure()
         run: |
           cat regression.diffs || true
-          echo "=== Actual output ==="
-          cat results/pgaudix_test.out || true
