@@ -41,13 +41,13 @@ jobs:
           sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }}
 
       - name: Build extension
-        run: make USE_PGXS=1
+        run: make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
 
       - name: Install extension
-        run: sudo make USE_PGXS=1 install
+        run: sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config install
 
       - name: Run regression tests
-        run: make USE_PGXS=1 installcheck PGUSER=postgres PGHOST=localhost PGPORT=5432 PGDATABASE=pgaudix_test
+        run: make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config installcheck PGUSER=postgres PGHOST=localhost PGPORT=5432 PGDATABASE=pgaudix_test
         env:
           PGPASSWORD: postgres
 
