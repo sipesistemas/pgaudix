@@ -1,0 +1,10 @@
+# Force LF line endings for files used by pg_regress
+test/**/*.sql text eol=lf
+test/**/*.out text eol=lf
+
+# SQL files used by PostgreSQL
+*.sql text eol=lf
+
+# C source files
+*.c text eol=lf
+*.h text eol=lf
