@@ -78,12 +78,13 @@ jobs:
       - name: Package release
         shell: msys2 {0}
         run: |
+          pacman -S --noconfirm zip
           PG_VERSION=$(pg_config --version | grep -oP '\d+')
           VERSION="${GITHUB_REF_NAME#v}"
           DIST="pgaudix-${VERSION}-pg${PG_VERSION}-windows-amd64"
           mkdir "$DIST"
           cp pgaudix.dll pgaudix.control pgaudix--*.sql install.bat "$DIST/"
-          7z a "${DIST}.zip" "$DIST"
+          zip -r "${DIST}.zip" "$DIST"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
