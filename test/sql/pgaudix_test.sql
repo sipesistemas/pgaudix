@@ -125,7 +125,53 @@ SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
 
 -- ============================================================
+-- Test 11: Permission check for SECURITY DEFINER APIs
+-- ============================================================
+CREATE FUNCTION public.capture_enable_error(target_table regclass)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pgaudix.enable(target_table);
+    RETURN null;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN SQLERRM;
+END;
+$$;
+
+CREATE TABLE public.test_no_trigger_priv (id int);
+CREATE ROLE pgaudix_no_trigger_role;
+GRANT USAGE ON SCHEMA public TO pgaudix_no_trigger_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.test_no_trigger_priv TO pgaudix_no_trigger_role;
+
+SET SESSION AUTHORIZATION pgaudix_no_trigger_role;
+SELECT public.capture_enable_error('public.test_no_trigger_priv'::regclass) LIKE
+       'pgaudix: permission denied for table public.test_no_trigger_priv';
+RESET SESSION AUTHORIZATION;
+
+SELECT count(*) FROM pgaudix.status()
+WHERE source_schema = 'public' AND source_table = 'test_no_trigger_priv';
+
+-- ============================================================
+-- Test 12: Reject protected schemas
+-- ============================================================
+CREATE TABLE pgaudix.test_internal_table (id int);
+
+SELECT public.capture_enable_error('pgaudix.test_internal_table'::regclass) LIKE
+       'pgaudix: auditing is not allowed for schema pgaudix';
+
+SELECT count(*) FROM pgaudix.status()
+WHERE source_schema = 'pgaudix' AND source_table = 'test_internal_table';
+
+DROP TABLE pgaudix.test_internal_table;
+DROP FUNCTION public.capture_enable_error(regclass);
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP OWNED BY pgaudix_no_trigger_role;
+DROP TABLE public.test_no_trigger_priv;
+DROP ROLE pgaudix_no_trigger_role;
 DROP TABLE public.test_orders;
 DROP EXTENSION pgaudix;
