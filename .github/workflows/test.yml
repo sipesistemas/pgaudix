@@ -12,7 +12,7 @@ jobs:
 
     strategy:
       matrix:
-        pg_version: [17, 16, 15]
+        pg_version: [18, 17, 16, 15]
 
     services:
       postgres:
