@@ -104,9 +104,14 @@ WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
 -- ============================================================
 SELECT pgaudix.disable('public.test_orders');
 
--- Trigger should be gone
+-- DML trigger should be gone
 SELECT count(*) FROM pg_trigger
 WHERE tgname = 'pgaudix_audit_trigger'
+  AND tgrelid = 'public.test_orders'::regclass;
+
+-- TRUNCATE trigger should be gone
+SELECT count(*) FROM pg_trigger
+WHERE tgname = 'pgaudix_truncate_trigger'
   AND tgrelid = 'public.test_orders'::regclass;
 
 -- Audit table should still exist
@@ -125,7 +130,141 @@ SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
 
 -- ============================================================
+-- Test 11: SECURITY DEFINER search_path (H1)
+-- ============================================================
+SELECT proname, proconfig
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE n.nspname = 'pgaudix'
+  AND p.proname IN ('enable', 'disable', 'ddl_sync', 'truncate_trigger', 'audit_trigger')
+  AND proconfig::text LIKE '%search_path%'
+ORDER BY proname;
+
+-- ============================================================
+-- Test 12: Duplicate enable() is rejected (H3)
+-- ============================================================
+SELECT pgaudix.enable('public.test_orders');
+
+-- Try enabling again — should fail
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_orders');
+    RAISE NOTICE 'ERROR: duplicate enable should have failed';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: duplicate enable rejected: %', SQLERRM;
+END;
+$$;
+
+-- ============================================================
+-- Test 13: TRUNCATE audit (M1)
+-- ============================================================
+INSERT INTO public.test_orders (amount, status) VALUES (300.00, 'active');
+INSERT INTO public.test_orders (amount, status) VALUES (400.00, 'active');
+TRUNCATE public.test_orders;
+
+-- Should have I, I, and T rows
+SELECT audit_operation, id, amount, status
+FROM public.test_orders_audit
+ORDER BY audit_id;
+
+-- ============================================================
+-- Test 14: Audit table permissions (M2)
+-- ============================================================
+-- Create a test role
+CREATE ROLE pgaudix_test_user LOGIN;
+GRANT USAGE ON SCHEMA public TO pgaudix_test_user;
+GRANT ALL ON public.test_orders TO pgaudix_test_user;
+GRANT USAGE ON SEQUENCE public.test_orders_id_seq TO pgaudix_test_user;
+GRANT SELECT ON public.test_orders_audit TO pgaudix_test_user;
+
+-- Test that direct INSERT to audit table is denied
+SET ROLE pgaudix_test_user;
+DO $$
+BEGIN
+    EXECUTE 'INSERT INTO public.test_orders_audit (audit_operation) VALUES (''X'')';
+    RAISE NOTICE 'ERROR: direct audit INSERT should have been denied';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'OK: direct audit INSERT denied';
+END;
+$$;
+
+-- Test that DML on source table still works (trigger has SECURITY DEFINER)
+INSERT INTO public.test_orders (amount, status) VALUES (500.00, 'test');
+
+RESET ROLE;
+
+-- Verify the audit row was created by the trigger (audit_user = session_user)
+SELECT audit_operation, audit_user = session_user AS correct_user, amount, status
+FROM public.test_orders_audit
+WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+
+-- Cleanup test role
+REVOKE ALL ON public.test_orders FROM pgaudix_test_user;
+REVOKE ALL ON SEQUENCE public.test_orders_id_seq FROM pgaudix_test_user;
+REVOKE ALL ON public.test_orders_audit FROM pgaudix_test_user;
+REVOKE USAGE ON SCHEMA public FROM pgaudix_test_user;
+DROP ROLE pgaudix_test_user;
+
+-- ============================================================
+-- Test 15: RENAME TABLE keeps auditing working (H2)
+-- ============================================================
+-- Clear audit data for clean test
+TRUNCATE public.test_orders_audit;
+
+ALTER TABLE public.test_orders RENAME TO test_orders_renamed;
+
+-- Verify registration was updated
+SELECT source_table, audit_table
+FROM pgaudix.status();
+
+-- DML on renamed table should still be audited
+INSERT INTO public.test_orders_renamed (amount, status) VALUES (600.00, 'renamed');
+
+SELECT audit_operation, amount, status
+FROM public.test_orders_audit
+WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+
+-- DDL sync should still work after rename
+ALTER TABLE public.test_orders_renamed ADD COLUMN extra text;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
+  AND column_name = 'extra';
+
+-- Rename back for cleanup
+ALTER TABLE public.test_orders_renamed RENAME TO test_orders;
+ALTER TABLE public.test_orders DROP COLUMN extra;
+
+-- ============================================================
+-- Test 16: SPI error handling - audit failure aborts DML (C1)
+-- ============================================================
+-- Force an audit column mismatch by dropping a column from audit table directly
+-- (Disable DDL sync guard temporarily)
+SELECT pgaudix.disable('public.test_orders', drop_data := true);
+SELECT pgaudix.enable('public.test_orders');
+TRUNCATE public.test_orders_audit;
+
+-- Drop a column from audit table to cause a mismatch
+-- The ddl_sync will fire and warn, but the DROP proceeds
+ALTER TABLE public.test_orders_audit DROP COLUMN status;
+
+-- Now INSERT should fail because the trigger tries to write to a missing column
+DO $$
+BEGIN
+    INSERT INTO public.test_orders (amount, status) VALUES (999.99, 'should_fail');
+    RAISE NOTICE 'ERROR: INSERT should have failed due to audit column mismatch';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: INSERT aborted due to audit failure: %', SQLERRM;
+END;
+$$;
+
+-- Verify no row was inserted into the source table
+SELECT count(*) FROM public.test_orders WHERE amount = 999.99;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+SELECT pgaudix.disable('public.test_orders', drop_data := true);
 DROP TABLE public.test_orders;
 DROP EXTENSION pgaudix;

@@ -5,14 +5,15 @@ A native PostgreSQL extension for automatic table auditing. It mirrors table col
 ## Features
 
 - **Automatic audit tables**: creates a `<table>_audit` table with all columns from the source table plus audit metadata
-- **DML tracking**: captures every INSERT, UPDATE, and DELETE operation
-- **UPDATE detail**: stores two rows per UPDATE — one with old values (`U-`) and one with new values (`U+`)
-- **DDL sync**: automatically propagates `ALTER TABLE` changes (add/drop/rename columns, type changes) to the audit table
+- **DML tracking**: captures every INSERT, UPDATE, DELETE, and TRUNCATE operation
+- **Single-row audit**: one audit row per operation with current values (`I`, `U`, `D`, `T`)
+- **DDL sync**: automatically propagates `ALTER TABLE` changes (add/drop/rename columns, type changes) to the audit table, including table renames
 - **High performance**: the DML trigger is written in C using PostgreSQL's SPI interface
+- **Write-protected audit tables**: audit tables are locked down — only the trigger can write to them
 
 ## Requirements
 
-- PostgreSQL 17+
+- PostgreSQL 16+
 - Docker (for development)
 
 ## Quick Start
@@ -68,7 +69,7 @@ This creates `orders_audit` in the same schema with:
 | Column              | Type                     | Description                     |
 |---------------------|--------------------------|---------------------------------|
 | `audit_id`          | `bigserial`              | Unique audit row identifier     |
-| `audit_operation`   | `char(1)`                | `I`, `U`, or `D`               |
+| `audit_operation`   | `char(1)`                | `I`, `U`, `D`, or `T`          |
 | `audit_timestamp`   | `timestamptz`            | When the operation happened     |
 | `audit_txid`        | `bigint`                 | Transaction ID                  |
 | `audit_user`        | `name`                   | User who performed the action   |
@@ -117,6 +118,20 @@ SELECT audit_operation, id, amount, status FROM orders_audit ORDER BY audit_id;
 --  U               |  1 | 105.00 | shipped
 --  D               |  1 | 105.00 | shipped
 ```
+
+**TRUNCATE** — one audit row with NULL data columns:
+
+```sql
+TRUNCATE orders;
+
+SELECT audit_operation, id, amount, status FROM orders_audit ORDER BY audit_id;
+--  audit_operation | id | amount | status
+-- ----------------+----+--------+---------
+--  ...previous rows...
+--  T               |    |        |
+```
+
+> TRUNCATE cannot capture individual row values (PostgreSQL limitation), but pgaudix records that a TRUNCATE happened.
 
 ### Automatic DDL sync
 
@@ -167,16 +182,6 @@ SELECT pgaudix.disable('orders', drop_data := true);
 | `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. |
 | `pgaudix.status()` | List all monitored tables with their status. |
 
-## Configuration
-
-| GUC Parameter | Default | Description |
-|---------------|---------|-------------|
-| `pgaudix.log_query` | `off` | When enabled, captures the SQL query text in audit rows. |
-
-```sql
-SET pgaudix.log_query = on;
-```
-
 ## Development
 
 ### Rebuild after code changes
@@ -216,11 +221,22 @@ pgaudix/
         └── pgaudix_test.out   # Expected test output
 ```
 
+## Security
+
+- All API functions (`enable`, `disable`, `ddl_sync`) use `SECURITY DEFINER` with an explicit `SET search_path` to prevent search path injection
+- The C trigger function validates its arguments against injection attacks
+- Audit tables are protected: `INSERT`, `UPDATE`, and `DELETE` are revoked from `PUBLIC` — only the trigger (running as `SECURITY DEFINER`) can write audit rows
+- The `audit_user` column captures `session_user` (the authenticated identity) rather than `current_user`, so it cannot be spoofed via `SET ROLE`
+- Concurrent `enable()` calls are serialized with an explicit lock to prevent race conditions
+- The `enable()` function rejects duplicate registrations
+- Direct `ALTER TABLE` on audit tables produces a warning
+
 ## Known Limitations
 
-- **TRUNCATE** is not audited (PostgreSQL row-level triggers do not fire for TRUNCATE)
+- TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table
 - Maximum of ~796 columns per source table (audit table has mirrored columns + 7 metadata columns, PostgreSQL limit is 1600)
+- Renaming a monitored source table updates the registration but does not rename the audit table
 
 ## License
 
