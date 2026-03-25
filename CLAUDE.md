@@ -8,7 +8,7 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 
 - **Hybrid C + PL/pgSQL**: C for DML trigger (performance), PL/pgSQL for API and DDL event trigger (maintainability)
 - **Storage model**: Single copy of mirrored columns. One row per operation with current values. Operations: `I` (insert), `U` (update, new values), `D` (delete, old values), `T` (truncate, NULL data).
-- **DDL sync**: Event trigger on `ddl_command_end` compares `pg_attribute` against stored `column_snapshots` by `attnum` to detect ADD/DROP/RENAME/TYPE CHANGE. Uses OID-based lookup for RENAME TABLE support.
+- **DDL sync**: Event trigger on `ddl_command_end` compares source `pg_attribute` against audit `pg_attribute` using attnum offset to detect ADD/DROP/RENAME/TYPE CHANGE. Audit table attnums are aligned with source via gap fillers in `enable()`. Uses OID-based lookup for RENAME TABLE support.
 - **Security**: All SECURITY DEFINER functions use `SET search_path`. C trigger validates tgargs format. Audit tables are write-protected (REVOKE from PUBLIC). Concurrent enable() calls are serialized.
 
 ## Key Files

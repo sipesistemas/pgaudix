@@ -19,14 +19,6 @@ CREATE TABLE pgaudix.monitored_tables (
     UNIQUE (source_schema, source_table)
 );
 
-CREATE TABLE pgaudix.column_snapshots (
-    table_id    int NOT NULL REFERENCES pgaudix.monitored_tables(id) ON DELETE CASCADE,
-    attnum      smallint NOT NULL,
-    attname     name NOT NULL,
-    atttype     text NOT NULL,
-    PRIMARY KEY (table_id, attnum)
-);
-
 -- ============================================================
 -- C trigger function declaration
 -- ============================================================
@@ -74,7 +66,6 @@ DECLARE
     v_audit_fqn text;
     v_audit_tgarg text;
     v_cols      text := '';
-    v_mon_id    int;
     rec         record;
 BEGIN
     -- Serialize concurrent enable() calls (H3)
@@ -112,17 +103,25 @@ BEGIN
         RAISE EXCEPTION 'pgaudix: audit table % already exists', v_audit_fqn;
     END IF;
 
-    -- Build column definitions from source table
+    -- Build column definitions from source table (with gap fillers for attnum alignment)
     FOR rec IN
-        SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type_name,
-               a.attnum
-        FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = target_table
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-        ORDER BY a.attnum
+        SELECT gs.n AS src_attnum, a.attname,
+               format_type(a.atttypid, a.atttypmod) AS type_name
+        FROM generate_series(
+            1,
+            (SELECT max(att.attnum) FROM pg_catalog.pg_attribute att
+             WHERE att.attrelid = target_table AND att.attnum > 0)
+        ) gs(n)
+        LEFT JOIN pg_catalog.pg_attribute a
+          ON a.attrelid = target_table AND a.attnum = gs.n
+         AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY gs.n
     LOOP
-        v_cols := v_cols || format(', %I %s', rec.attname, rec.type_name);
+        IF rec.attname IS NOT NULL THEN
+            v_cols := v_cols || format(', %I %s', rec.attname, rec.type_name);
+        ELSE
+            v_cols := v_cols || format(', _pgaudix_gap_%s int', rec.src_attnum);
+        END IF;
     END LOOP;
 
     -- Create the audit table
@@ -139,6 +138,21 @@ BEGIN
         ')',
         v_audit_fqn, v_cols
     );
+
+    -- Drop gap fillers to create matching attnum holes
+    PERFORM set_config('pgaudix.in_ddl_sync', 'true', true);
+    FOR rec IN
+        SELECT a.attname
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+        JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = v_schema AND c.relname = v_audit
+          AND a.attname LIKE '_pgaudix\_gap\_%' ESCAPE '\'
+          AND NOT a.attisdropped
+    LOOP
+        EXECUTE format('ALTER TABLE %s DROP COLUMN %I', v_audit_fqn, rec.attname);
+    END LOOP;
+    PERFORM set_config('pgaudix.in_ddl_sync', '', true);
 
     -- Create index on audit_timestamp
     EXECUTE format(
@@ -170,16 +184,7 @@ BEGIN
     -- Register in monitored_tables (with source OID for H2)
     INSERT INTO pgaudix.monitored_tables
         (source_oid, source_schema, source_table, audit_schema, audit_table)
-    VALUES (target_table, v_schema, v_table, v_schema, v_audit)
-    RETURNING id INTO v_mon_id;
-
-    -- Take a column snapshot for DDL sync
-    INSERT INTO pgaudix.column_snapshots (table_id, attnum, attname, atttype)
-    SELECT v_mon_id, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod)
-    FROM pg_catalog.pg_attribute a
-    WHERE a.attrelid = target_table
-      AND a.attnum > 0
-      AND NOT a.attisdropped;
+    VALUES (target_table, v_schema, v_table, v_schema, v_audit);
 END;
 $func$;
 
@@ -238,7 +243,7 @@ BEGIN
         );
     END IF;
 
-    -- Remove registration (cascades to column_snapshots)
+    -- Remove registration
     DELETE FROM pgaudix.monitored_tables WHERE id = mon.id;
 END;
 $func$;
@@ -279,12 +284,15 @@ AS $func$
 DECLARE
     cmd         record;
     mon         record;
-    snap        record;
     cur         record;
     v_audit_fqn text;
     v_source_oid oid;
+    v_audit_oid  oid;
+    v_offset     int;
     v_new_schema name;
     v_new_table  name;
+    v_new_audit  name;
+    v_new_tgarg  text;
 BEGIN
     -- Guard against recursive invocations from our own ALTERs on audit tables
     IF current_setting('pgaudix.in_ddl_sync', true) = 'true' THEN
@@ -325,7 +333,7 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Detect and handle RENAME TABLE (H2)
+        -- Detect and handle RENAME TABLE / SET SCHEMA (H2)
         SELECT n.nspname, c.relname
         INTO v_new_schema, v_new_table
         FROM pg_catalog.pg_class c
@@ -333,18 +341,81 @@ BEGIN
         WHERE c.oid = v_source_oid;
 
         IF v_new_schema != mon.source_schema OR v_new_table != mon.source_table THEN
+            v_new_audit := v_new_table || '_audit';
+
+            -- Rename the audit table to match
+            IF v_new_audit != mon.audit_table THEN
+                EXECUTE format(
+                    'ALTER TABLE %I.%I RENAME TO %I',
+                    mon.audit_schema, mon.audit_table, v_new_audit
+                );
+            END IF;
+
+            -- Move audit table to new schema if schema changed
+            IF v_new_schema != mon.audit_schema THEN
+                EXECUTE format(
+                    'ALTER TABLE %I.%I SET SCHEMA %I',
+                    mon.audit_schema, v_new_audit, v_new_schema
+                );
+            END IF;
+
+            -- Recreate DML trigger with updated audit table reference
+            EXECUTE format(
+                'DROP TRIGGER IF EXISTS pgaudix_audit_trigger ON %I.%I',
+                v_new_schema, v_new_table
+            );
+
+            v_new_tgarg := '"' || replace(v_new_schema::text, '"', '""')
+                        || '"."' || replace(v_new_audit::text, '"', '""') || '"';
+
+            EXECUTE format(
+                'CREATE TRIGGER pgaudix_audit_trigger '
+                'AFTER INSERT OR UPDATE OR DELETE ON %I.%I '
+                'FOR EACH ROW EXECUTE FUNCTION pgaudix.audit_trigger(%L)',
+                v_new_schema, v_new_table, v_new_tgarg
+            );
+
+            -- Recreate TRUNCATE trigger with updated arguments
+            EXECUTE format(
+                'DROP TRIGGER IF EXISTS pgaudix_truncate_trigger ON %I.%I',
+                v_new_schema, v_new_table
+            );
+
+            EXECUTE format(
+                'CREATE TRIGGER pgaudix_truncate_trigger '
+                'AFTER TRUNCATE ON %I.%I '
+                'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
+                v_new_schema, v_new_table, v_new_schema, v_new_audit
+            );
+
+            -- Update registration
             UPDATE pgaudix.monitored_tables
-            SET source_schema = v_new_schema, source_table = v_new_table
+            SET source_schema = v_new_schema, source_table = v_new_table,
+                audit_schema = v_new_schema, audit_table = v_new_audit
             WHERE id = mon.id;
 
             mon.source_schema := v_new_schema;
             mon.source_table := v_new_table;
+            mon.audit_schema := v_new_schema;
+            mon.audit_table := v_new_audit;
 
-            RAISE NOTICE 'pgaudix: updated registration for renamed table %.% (audit table unchanged: %.%)',
-                v_new_schema, v_new_table, mon.audit_schema, mon.audit_table;
+            RAISE NOTICE 'pgaudix: renamed audit table to %.%',
+                v_new_schema, v_new_audit;
         END IF;
 
         v_audit_fqn := format('%I.%I', mon.audit_schema, mon.audit_table);
+
+        -- Resolve audit table OID and attnum offset
+        SELECT c.oid INTO v_audit_oid
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = mon.audit_schema AND c.relname = mon.audit_table;
+
+        SELECT a.attnum INTO v_offset
+        FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = v_audit_oid
+          AND a.attname = 'audit_app_name'
+          AND NOT a.attisdropped;
 
         -- --------------------------------------------------------
         -- Detect ADDED columns
@@ -356,8 +427,10 @@ BEGIN
               AND a.attnum > 0
               AND NOT a.attisdropped
               AND NOT EXISTS (
-                  SELECT 1 FROM pgaudix.column_snapshots cs
-                  WHERE cs.table_id = mon.id AND cs.attnum = a.attnum
+                  SELECT 1 FROM pg_catalog.pg_attribute aud
+                  WHERE aud.attrelid = v_audit_oid
+                    AND aud.attnum = a.attnum + v_offset
+                    AND NOT aud.attisdropped
               )
         LOOP
             EXECUTE format(
@@ -369,20 +442,22 @@ BEGIN
         -- --------------------------------------------------------
         -- Detect DROPPED columns
         -- --------------------------------------------------------
-        FOR snap IN
-            SELECT cs.attnum, cs.attname
-            FROM pgaudix.column_snapshots cs
-            WHERE cs.table_id = mon.id
+        FOR cur IN
+            SELECT aud.attnum, aud.attname
+            FROM pg_catalog.pg_attribute aud
+            WHERE aud.attrelid = v_audit_oid
+              AND aud.attnum > v_offset
+              AND NOT aud.attisdropped
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_attribute a
                   WHERE a.attrelid = v_source_oid
-                    AND a.attnum = cs.attnum
+                    AND a.attnum = aud.attnum - v_offset
                     AND NOT a.attisdropped
               )
         LOOP
             EXECUTE format(
                 'ALTER TABLE %s DROP COLUMN IF EXISTS %I',
-                v_audit_fqn, snap.attname
+                v_audit_fqn, cur.attname
             );
         END LOOP;
 
@@ -391,14 +466,16 @@ BEGIN
         -- --------------------------------------------------------
         FOR cur IN
             SELECT a.attnum, a.attname AS new_name,
-                   cs.attname AS old_name
+                   aud.attname AS old_name
             FROM pg_catalog.pg_attribute a
-            JOIN pgaudix.column_snapshots cs
-              ON cs.table_id = mon.id AND cs.attnum = a.attnum
+            JOIN pg_catalog.pg_attribute aud
+              ON aud.attrelid = v_audit_oid
+             AND aud.attnum = a.attnum + v_offset
+             AND NOT aud.attisdropped
             WHERE a.attrelid = v_source_oid
               AND a.attnum > 0
               AND NOT a.attisdropped
-              AND a.attname != cs.attname
+              AND a.attname != aud.attname
         LOOP
             EXECUTE format(
                 'ALTER TABLE %s RENAME COLUMN %I TO %I',
@@ -411,34 +488,23 @@ BEGIN
         -- --------------------------------------------------------
         FOR cur IN
             SELECT a.attnum, a.attname,
-                   format_type(a.atttypid, a.atttypmod) AS new_type,
-                   cs.atttype AS old_type
+                   format_type(a.atttypid, a.atttypmod) AS new_type
             FROM pg_catalog.pg_attribute a
-            JOIN pgaudix.column_snapshots cs
-              ON cs.table_id = mon.id AND cs.attnum = a.attnum
+            JOIN pg_catalog.pg_attribute aud
+              ON aud.attrelid = v_audit_oid
+             AND aud.attnum = a.attnum + v_offset
+             AND NOT aud.attisdropped
             WHERE a.attrelid = v_source_oid
               AND a.attnum > 0
               AND NOT a.attisdropped
-              AND a.attname = cs.attname
-              AND format_type(a.atttypid, a.atttypmod) != cs.atttype
+              AND a.attname = aud.attname
+              AND format_type(a.atttypid, a.atttypmod) != format_type(aud.atttypid, aud.atttypmod)
         LOOP
             EXECUTE format(
                 'ALTER TABLE %s ALTER COLUMN %I TYPE %s',
                 v_audit_fqn, cur.attname, cur.new_type
             );
         END LOOP;
-
-        -- --------------------------------------------------------
-        -- Refresh the column snapshot
-        -- --------------------------------------------------------
-        DELETE FROM pgaudix.column_snapshots WHERE table_id = mon.id;
-
-        INSERT INTO pgaudix.column_snapshots (table_id, attnum, attname, atttype)
-        SELECT mon.id, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod)
-        FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = v_source_oid
-          AND a.attnum > 0
-          AND NOT a.attisdropped;
 
     END LOOP;
 END;

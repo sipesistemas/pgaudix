@@ -47,12 +47,11 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 
 ### SQL install script (`pgaudix--0.1.0.sql`)
 - `pgaudix.monitored_tables` — registration table with `source_oid` for OID-based lookup
-- `pgaudix.column_snapshots` — column state for DDL diff detection
-- `pgaudix.enable(regclass)` — creates audit table, triggers, registration. Serialized with LOCK TABLE.
+- `pgaudix.enable(regclass)` — creates audit table (with attnum gap alignment), triggers, registration. Serialized with LOCK TABLE.
 - `pgaudix.disable(regclass, bool)` — drops triggers, optionally drops audit table
 - `pgaudix.status()` — lists monitored tables
 - `pgaudix.truncate_trigger()` — PL/pgSQL AFTER TRUNCATE trigger (statement-level)
-- `pgaudix.ddl_sync()` — event trigger for ALTER TABLE: detects ADD/DROP/RENAME/TYPE CHANGE columns and RENAME TABLE. Blocks direct ALTER on audit tables. Uses recursion guard via `set_config`.
+- `pgaudix.ddl_sync()` — event trigger for ALTER TABLE: detects ADD/DROP/RENAME/TYPE CHANGE columns. On RENAME TABLE, automatically renames the audit table and recreates triggers with updated references. Blocks direct ALTER on audit tables. Uses recursion guard via `set_config`.
 
 ### Security
 - All SECURITY DEFINER functions use `SET search_path = pgaudix, pg_catalog`
@@ -61,7 +60,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - `enable()` serialized with `LOCK TABLE ... IN EXCLUSIVE MODE`
 - `audit_user` uses `session_user` (not `current_user`) for authentic identity
 
-## Test Cases (16 tests)
+## Test Cases (27 tests)
 
 1. Enable auditing
 2. INSERT audit
@@ -77,5 +76,16 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 12. Duplicate enable() rejection
 13. TRUNCATE audit
 14. Audit table permissions (REVOKE + SECURITY DEFINER trigger)
-15. RENAME TABLE continues auditing + DDL sync
+15. RENAME TABLE renames audit table + updates triggers + DDL sync
 16. SPI error handling (audit failure aborts source DML)
+17. NULL values in INSERT and UPDATE
+18. Multi-row UPDATE and DELETE
+19. Non-public schema
+20. Transaction rollback — no audit rows
+21. Same audit_txid within a transaction
+22. Disable then re-enable
+23. Multiple DDL changes in one ALTER
+24. Source column with audit_ prefix
+25. Enable on non-existent table
+26. Disable on non-monitored table
+27. Attnum gap alignment (enable on table with dropped columns, DML + DDL sync with gaps)

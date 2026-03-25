@@ -153,6 +153,10 @@ ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,4);
 -- Drop a column
 ALTER TABLE orders DROP COLUMN description;
 -- orders_audit column is dropped too
+
+-- Rename the table
+ALTER TABLE orders RENAME TO orders_v2;
+-- orders_audit is renamed to orders_v2_audit, triggers updated automatically
 ```
 
 ### Check monitored tables
@@ -236,7 +240,6 @@ pgaudix/
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table
 - Maximum of ~796 columns per source table (audit table has mirrored columns + 7 metadata columns, PostgreSQL limit is 1600)
-- Renaming a monitored source table updates the registration but does not rename the audit table
 
 ## License
 
