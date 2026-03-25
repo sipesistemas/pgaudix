@@ -72,14 +72,14 @@ jobs:
       - name: Build extension
         shell: msys2 {0}
         run: |
-          PG_VERSION=$(pg_config --version | grep -oP '\d+')
+          PG_VERSION=$(pg_config --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
           echo "Building for PostgreSQL $PG_VERSION"
           make USE_PGXS=1
 
       - name: Package release
         shell: msys2 {0}
         run: |
-          PG_VERSION=$(pg_config --version | grep -oP '\d+')
+          PG_VERSION=$(pg_config --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
           VERSION="${GITHUB_REF_NAME#v}"
           DIST="pgaudix-${VERSION}-pg${PG_VERSION}-windows-amd64"
           mkdir "$DIST"
