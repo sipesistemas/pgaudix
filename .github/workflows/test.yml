@@ -52,4 +52,7 @@ jobs:
 
       - name: Show test diff on failure
         if: failure()
-        run: cat regression.diffs || true
+        run: |
+          cat regression.diffs || true
+          echo "=== Actual output ==="
+          cat results/pgaudix_test.out || true
