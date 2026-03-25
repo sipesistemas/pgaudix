@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [18, 17, 16]
+
+    container:
+      image: postgres:${{ matrix.pg_version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-${{ matrix.pg_version }}
+
+      - name: Build extension
+        run: make USE_PGXS=1
+
+      - name: Run tests
+        run: |
+          chown -R postgres:postgres .
+          su postgres -c "pg_ctl -D /tmp/pgdata initdb"
+          su postgres -c "pg_ctl -D /tmp/pgdata -l /tmp/pg.log start"
+          su postgres -c "make USE_PGXS=1 installcheck"
+
+      - name: Package release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST="pgaudix-${VERSION}-pg${{ matrix.pg_version }}-linux-amd64"
+          mkdir "$DIST"
+          cp pgaudix.so pgaudix.control pgaudix--*.sql install.sh "$DIST/"
+          chmod +x "$DIST/install.sh"
+          tar czf "${DIST}.tar.gz" "$DIST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgaudix-pg${{ matrix.pg_version }}-linux-amd64
+          path: pgaudix-*-linux-amd64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [17, 16]
+        include:
+          - pg_version: 17
+            choco_version: '17.4.0'
+          - pg_version: 16
+            choco_version: '16.8.0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL
+        shell: cmd
+        run: choco install postgresql${{ matrix.pg_version }} --version=${{ matrix.choco_version }} --params "/Password:postgres" -y --no-progress
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            make
+
+      - name: Build extension
+        shell: msys2 {0}
+        run: |
+          export PG_CONFIG="/c/Program Files/PostgreSQL/${{ matrix.pg_version }}/bin/pg_config"
+          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+
+      - name: Package release
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST="pgaudix-${VERSION}-pg${{ matrix.pg_version }}-windows-amd64"
+          mkdir "$DIST"
+          cp pgaudix.dll pgaudix.control pgaudix--*.sql install.bat "$DIST/"
+          7z a "${DIST}.zip" "$DIST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgaudix-pg${{ matrix.pg_version }}-windows-amd64
+          path: pgaudix-*-windows-amd64.zip
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "pgaudix ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            dist/*
