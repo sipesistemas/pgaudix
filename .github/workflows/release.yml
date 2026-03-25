@@ -83,7 +83,11 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DIST="pgaudix-${VERSION}-pg${PG_VERSION}-windows-amd64"
           mkdir "$DIST"
-          cp pgaudix.dll pgaudix.control pgaudix--*.sql install.bat "$DIST/"
+          # Copy the built shared library (could be .dll or .so depending on MSYS2 PG build)
+          SHLIB=$(ls pgaudix.dll pgaudix.so 2>/dev/null | head -1)
+          echo "Found shared library: $SHLIB"
+          cp "$SHLIB" "$DIST/pgaudix.dll"
+          cp pgaudix.control pgaudix--*.sql install.bat "$DIST/"
           zip -r "${DIST}.zip" "$DIST"
 
       - name: Upload artifact
