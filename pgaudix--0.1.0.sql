@@ -65,7 +65,9 @@ BEGIN
         RAISE EXCEPTION 'pgaudix: permission denied for table %.%', v_schema, v_table;
     END IF;
 
-    IF v_schema IN ('pg_catalog', 'information_schema', 'pgaudix') THEN
+    IF v_schema = 'information_schema'
+       OR v_schema = 'pgaudix'
+       OR v_schema LIKE 'pg\_%' ESCAPE '\' THEN
         RAISE EXCEPTION 'pgaudix: auditing is not allowed for schema %', v_schema;
     END IF;
 

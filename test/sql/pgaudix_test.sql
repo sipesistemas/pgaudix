@@ -133,7 +133,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     PERFORM pgaudix.enable(target_table);
-    RETURN null;
+    RETURN NULL;
 EXCEPTION
     WHEN OTHERS THEN
         RETURN SQLERRM;
@@ -146,23 +146,53 @@ GRANT USAGE ON SCHEMA public TO pgaudix_no_trigger_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.test_no_trigger_priv TO pgaudix_no_trigger_role;
 
 SET SESSION AUTHORIZATION pgaudix_no_trigger_role;
-SELECT public.capture_enable_error('public.test_no_trigger_priv'::regclass) LIKE
-       'pgaudix: permission denied for table public.test_no_trigger_priv';
+DO $$
+DECLARE
+    v_err text;
+BEGIN
+    v_err := public.capture_enable_error('public.test_no_trigger_priv'::regclass);
+    IF NOT (
+        v_err LIKE '%permission denied%'
+        AND
+        v_err LIKE '%test_no_trigger_priv%'
+    ) THEN
+        RAISE EXCEPTION 'expected permission denied for test_no_trigger_priv';
+    END IF;
+END;
+$$;
 RESET SESSION AUTHORIZATION;
 
 SELECT count(*) FROM pgaudix.status()
 WHERE source_schema = 'public' AND source_table = 'test_no_trigger_priv';
+
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = 'public' AND table_name = 'test_no_trigger_priv_audit';
 
 -- ============================================================
 -- Test 12: Reject protected schemas
 -- ============================================================
 CREATE TABLE pgaudix.test_internal_table (id int);
 
-SELECT public.capture_enable_error('pgaudix.test_internal_table'::regclass) LIKE
-       'pgaudix: auditing is not allowed for schema pgaudix';
+DO $$
+DECLARE
+    v_err text;
+BEGIN
+    v_err := public.capture_enable_error('pgaudix.test_internal_table'::regclass);
+    IF NOT (
+        v_err LIKE '%auditing is not allowed for schema%'
+        AND
+        v_err LIKE '%pgaudix%'
+    ) THEN
+        RAISE EXCEPTION 'expected schema protection error for pgaudix schema';
+    END IF;
+END;
+$$;
 
 SELECT count(*) FROM pgaudix.status()
 WHERE source_schema = 'pgaudix' AND source_table = 'test_internal_table';
+
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = 'pgaudix' AND table_name = 'test_internal_table_audit';
 
 DROP TABLE pgaudix.test_internal_table;
 DROP FUNCTION public.capture_enable_error(regclass);

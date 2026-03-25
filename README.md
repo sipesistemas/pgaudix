@@ -221,7 +221,7 @@ pgaudix/
 - **TRUNCATE** is not audited (PostgreSQL row-level triggers do not fire for TRUNCATE)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table
 - Maximum of ~796 columns per source table (audit table has mirrored columns + 7 metadata columns, PostgreSQL limit is 1600)
-- Auditing cannot be enabled for `pg_catalog`, `information_schema`, or `pgaudix` schemas
+- Auditing cannot be enabled for `information_schema`, `pgaudix`, or any schema starting with `pg_`
 
 ## License
 
