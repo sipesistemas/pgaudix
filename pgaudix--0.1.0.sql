@@ -43,6 +43,7 @@ CREATE FUNCTION pgaudix.enable(target_table regclass)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, pgaudix
 AS $func$
 DECLARE
     v_schema    name;
@@ -59,6 +60,14 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE c.oid = target_table;
+
+    IF NOT has_table_privilege(session_user, target_table, 'TRIGGER') THEN
+        RAISE EXCEPTION 'pgaudix: permission denied for table %.%', v_schema, v_table;
+    END IF;
+
+    IF v_schema IN ('pg_catalog', 'information_schema', 'pgaudix') THEN
+        RAISE EXCEPTION 'pgaudix: auditing is not allowed for schema %', v_schema;
+    END IF;
 
     v_audit := v_table || '_audit';
     v_audit_fqn := format('%I.%I', v_schema, v_audit);
@@ -149,6 +158,7 @@ CREATE FUNCTION pgaudix.disable(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, pgaudix
 AS $func$
 DECLARE
     v_schema    name;
@@ -161,6 +171,10 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE c.oid = target_table;
+
+    IF NOT has_table_privilege(session_user, target_table, 'TRIGGER') THEN
+        RAISE EXCEPTION 'pgaudix: permission denied for table %.%', v_schema, v_table;
+    END IF;
 
     -- Find the registration
     SELECT * INTO mon
@@ -221,6 +235,7 @@ CREATE FUNCTION pgaudix.ddl_sync()
 RETURNS event_trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, pgaudix
 AS $func$
 DECLARE
     cmd         record;

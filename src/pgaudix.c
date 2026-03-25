@@ -128,7 +128,8 @@ insert_audit_row(const char *operation, HeapTuple tuple, TupleDesc tupdesc,
 					 "INSERT INTO %s (%s) VALUES (%s)",
 					 audit_table, cols.data, vals.data);
 
-	SPI_execute_with_args(query.data, nparams, types, values, nulls, false, 0);
+	if (SPI_execute_with_args(query.data, nparams, types, values, nulls, false, 0) < 0)
+		elog(ERROR, "pgaudix: failed to insert audit row into %s", audit_table);
 
 	pfree(cols.data);
 	pfree(vals.data);
@@ -173,13 +174,14 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 
 	tupdesc = trigdata->tg_relation->rd_att;
 
-	SPI_connect();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pgaudix: SPI_connect failed");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 	{
-		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_trigtuple, tupdesc,
+		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_newtuple, tupdesc,
 						 audit_table);
-		rettuple = trigdata->tg_trigtuple;
+		rettuple = trigdata->tg_newtuple;
 	}
 	else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
 	{
@@ -199,7 +201,8 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 		rettuple = NULL; /* keep compiler quiet */
 	}
 
-	SPI_finish();
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "pgaudix: SPI_finish failed");
 
 	return PointerGetDatum(rettuple);
 }
