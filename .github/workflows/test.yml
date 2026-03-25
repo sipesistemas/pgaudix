@@ -34,6 +34,7 @@ jobs:
 
       - name: Start PostgreSQL and run tests
         run: |
+          chown -R postgres:postgres .
           su postgres -c "pg_ctl -D /tmp/pgdata initdb"
           su postgres -c "pg_ctl -D /tmp/pgdata -l /tmp/pg.log start"
           su postgres -c "make USE_PGXS=1 installcheck"
