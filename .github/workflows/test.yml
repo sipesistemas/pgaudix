@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        pg_version: [17, 16, 15]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg_version }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pgaudix_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }}
+
+      - name: Build extension
+        run: make USE_PGXS=1
+
+      - name: Install extension
+        run: sudo make USE_PGXS=1 install
+
+      - name: Run regression tests
+        run: make USE_PGXS=1 installcheck PGUSER=postgres PGHOST=localhost PGPORT=5432 PGDATABASE=pgaudix_test
+        env:
+          PGPASSWORD: postgres
+
+      - name: Show test diff on failure
+        if: failure()
+        run: cat regression.diffs || true

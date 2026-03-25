@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.so
+*.bc
+*.a
+*.pc
+
+# PGXS regression test output
+results/
+regression.diffs
+regression.out
+tmp_check/
+tmp_check_iso/
+log/
+output_iso/
+
+# IDE
+.vscode/
+.idea/

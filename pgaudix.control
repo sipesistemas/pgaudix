@@ -1,0 +1,6 @@
+comment = 'Automatic table auditing with column mirroring and DDL sync'
+default_version = '0.1.0'
+module_pathname = '$libdir/pgaudix'
+relocatable = false
+schema = pgaudix
+superuser = true
