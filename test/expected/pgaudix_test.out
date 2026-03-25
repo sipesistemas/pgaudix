@@ -1,8 +1,6 @@
 -- pgaudix regression tests
-
 -- Setup
 CREATE EXTENSION pgaudix;
-
 -- ============================================================
 -- Test 1: Enable auditing
 -- ============================================================
@@ -11,123 +9,198 @@ CREATE TABLE public.test_orders (
     amount  numeric(10,2),
     status  text
 );
-
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
 
 -- Verify audit table exists
 SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
 ORDER BY ordinal_position;
+    column_name    |        data_type         
+-------------------+--------------------------
+ audit_id          | bigint
+ audit_operation   | character
+ audit_timestamp   | timestamp with time zone
+ audit_txid        | bigint
+ audit_user        | name
+ audit_client_addr | inet
+ audit_app_name    | text
+ id                | integer
+ amount            | numeric
+ status            | text
+(10 rows)
 
 -- Verify registration
 SELECT source_schema, source_table, audit_table, enabled
 FROM pgaudix.status();
+ source_schema | source_table |    audit_table    | enabled 
+---------------+--------------+-------------------+---------
+ public        | test_orders  | test_orders_audit | t
+(1 row)
 
 -- ============================================================
 -- Test 2: INSERT audit
 -- ============================================================
 INSERT INTO public.test_orders (amount, status) VALUES (100.50, 'pending');
-
 SELECT audit_operation, audit_user, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | audit_user | id | amount | status  
+-----------------+------------+----+--------+---------
+ I               | postgres   |  1 | 100.50 | pending
+(1 row)
 
 -- ============================================================
 -- Test 3: UPDATE audit (single row with new values)
 -- ============================================================
 UPDATE public.test_orders SET status = 'shipped', amount = 105.00 WHERE id = 1;
-
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | id | amount | status  
+-----------------+----+--------+---------
+ I               |  1 | 100.50 | pending
+ U               |  1 | 105.00 | shipped
+(2 rows)
 
 -- ============================================================
 -- Test 4: DELETE audit
 -- ============================================================
 DELETE FROM public.test_orders WHERE id = 1;
-
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | id | amount | status  
+-----------------+----+--------+---------
+ I               |  1 | 100.50 | pending
+ U               |  1 | 105.00 | shipped
+ D               |  1 | 105.00 | shipped
+(3 rows)
 
 -- ============================================================
 -- Test 5: DDL sync - ADD COLUMN
 -- ============================================================
 ALTER TABLE public.test_orders ADD COLUMN notes text;
-
 -- Verify the audit table also has the new column
 SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'notes';
+ column_name | data_type 
+-------------+-----------
+ notes       | text
+(1 row)
 
 -- Test that new column is audited
 INSERT INTO public.test_orders (amount, status, notes) VALUES (200.00, 'new', 'test note');
-
 SELECT audit_operation, amount, status, notes
 FROM public.test_orders_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+ audit_operation | amount | status |   notes   
+-----------------+--------+--------+-----------
+ I               | 200.00 | new    | test note
+(1 row)
 
 -- ============================================================
 -- Test 6: DDL sync - RENAME COLUMN
 -- ============================================================
 ALTER TABLE public.test_orders RENAME COLUMN notes TO description;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'description';
+ column_name 
+-------------
+ description
+(1 row)
 
 -- ============================================================
 -- Test 7: DDL sync - ALTER COLUMN TYPE
 -- ============================================================
 ALTER TABLE public.test_orders ALTER COLUMN amount TYPE numeric(12,4);
-
 SELECT column_name, numeric_precision, numeric_scale
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'amount';
+ column_name | numeric_precision | numeric_scale 
+-------------+-------------------+---------------
+ amount      |                12 |             4
+(1 row)
 
 -- ============================================================
 -- Test 8: DDL sync - DROP COLUMN
 -- ============================================================
 ALTER TABLE public.test_orders DROP COLUMN description;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'description';
+ column_name 
+-------------
+(0 rows)
 
 -- ============================================================
 -- Test 9: Disable auditing (keep data)
 -- ============================================================
 SELECT pgaudix.disable('public.test_orders');
+ disable 
+---------
+ 
+(1 row)
 
 -- DML trigger should be gone
 SELECT count(*) FROM pg_trigger
 WHERE tgname = 'pgaudix_audit_trigger'
   AND tgrelid = 'public.test_orders'::regclass;
+ count 
+-------
+     0
+(1 row)
 
 -- TRUNCATE trigger should be gone
 SELECT count(*) FROM pg_trigger
 WHERE tgname = 'pgaudix_truncate_trigger'
   AND tgrelid = 'public.test_orders'::regclass;
+ count 
+-------
+     0
+(1 row)
 
 -- Audit table should still exist
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
+ count 
+-------
+     1
+(1 row)
 
 -- ============================================================
 -- Test 10: Disable with drop_data
 -- ============================================================
 DROP TABLE IF EXISTS public.test_orders_audit;
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
+
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
 
 -- Audit table should be gone
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
+ count 
+-------
+     0
+(1 row)
 
 -- ============================================================
 -- Test 11: SECURITY DEFINER search_path (H1)
@@ -139,11 +212,23 @@ WHERE n.nspname = 'pgaudix'
   AND p.proname IN ('enable', 'disable', 'ddl_sync', 'truncate_trigger', 'audit_trigger')
   AND proconfig::text LIKE '%search_path%'
 ORDER BY proname;
+     proname      |              proconfig              
+------------------+-------------------------------------
+ audit_trigger    | {"search_path=pgaudix, pg_catalog"}
+ ddl_sync         | {"search_path=pgaudix, pg_catalog"}
+ disable          | {"search_path=pgaudix, pg_catalog"}
+ enable           | {"search_path=pgaudix, pg_catalog"}
+ truncate_trigger | {"search_path=pgaudix, pg_catalog"}
+(5 rows)
 
 -- ============================================================
 -- Test 12: Duplicate enable() is rejected (H3)
 -- ============================================================
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
 
 -- Try enabling again — should fail
 DO $$
@@ -154,18 +239,23 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: duplicate enable rejected: %', SQLERRM;
 END;
 $$;
-
+NOTICE:  OK: duplicate enable rejected: pgaudix: table public.test_orders is already monitored
 -- ============================================================
 -- Test 13: TRUNCATE audit (M1)
 -- ============================================================
 INSERT INTO public.test_orders (amount, status) VALUES (300.00, 'active');
 INSERT INTO public.test_orders (amount, status) VALUES (400.00, 'active');
 TRUNCATE public.test_orders;
-
 -- Should have I, I, and T rows
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | id |  amount  | status 
+-----------------+----+----------+--------
+ I               |  3 | 300.0000 | active
+ I               |  4 | 400.0000 | active
+ T               |    |          | 
+(3 rows)
 
 -- ============================================================
 -- Test 14: Audit table permissions (M2)
@@ -176,7 +266,6 @@ GRANT USAGE ON SCHEMA public TO pgaudix_test_user;
 GRANT ALL ON public.test_orders TO pgaudix_test_user;
 GRANT USAGE ON SEQUENCE public.test_orders_id_seq TO pgaudix_test_user;
 GRANT SELECT ON public.test_orders_audit TO pgaudix_test_user;
-
 -- Test that direct INSERT to audit table is denied
 SET ROLE pgaudix_test_user;
 DO $$
@@ -187,16 +276,18 @@ EXCEPTION WHEN insufficient_privilege THEN
     RAISE NOTICE 'OK: direct audit INSERT denied';
 END;
 $$;
-
+NOTICE:  OK: direct audit INSERT denied
 -- Test that DML on source table still works (trigger has SECURITY DEFINER)
 INSERT INTO public.test_orders (amount, status) VALUES (500.00, 'test');
-
 RESET ROLE;
-
 -- Verify the audit row was created by the trigger (audit_user = session_user)
 SELECT audit_operation, audit_user = session_user AS correct_user, amount, status
 FROM public.test_orders_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+ audit_operation | correct_user |  amount  | status 
+-----------------+--------------+----------+--------
+ I               | t            | 500.0000 | test
+(1 row)
 
 -- Cleanup test role
 REVOKE ALL ON public.test_orders FROM pgaudix_test_user;
@@ -204,66 +295,94 @@ REVOKE ALL ON SEQUENCE public.test_orders_id_seq FROM pgaudix_test_user;
 REVOKE ALL ON public.test_orders_audit FROM pgaudix_test_user;
 REVOKE USAGE ON SCHEMA public FROM pgaudix_test_user;
 DROP ROLE pgaudix_test_user;
-
 -- ============================================================
 -- Test 15: RENAME TABLE renames audit table too (H2)
 -- ============================================================
 -- Clear audit data for clean test
 TRUNCATE public.test_orders_audit;
-
 ALTER TABLE public.test_orders RENAME TO test_orders_renamed;
-
+NOTICE:  pgaudix: renamed audit table to public.test_orders_renamed_audit
 -- Verify both source and audit table names were updated
 SELECT source_table, audit_table
 FROM pgaudix.status();
+    source_table     |        audit_table        
+---------------------+---------------------------
+ test_orders_renamed | test_orders_renamed_audit
+(1 row)
 
 -- Old audit table should no longer exist
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
+ count 
+-------
+     0
+(1 row)
 
 -- New audit table should exist
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_renamed_audit';
+ count 
+-------
+     1
+(1 row)
 
 -- DML on renamed table should go to the new audit table
 INSERT INTO public.test_orders_renamed (amount, status) VALUES (600.00, 'renamed');
-
 SELECT audit_operation, amount, status
 FROM public.test_orders_renamed_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_renamed_audit);
+ audit_operation |  amount  | status  
+-----------------+----------+---------
+ I               | 600.0000 | renamed
+(1 row)
 
 -- DDL sync should still work on the renamed audit table
 ALTER TABLE public.test_orders_renamed ADD COLUMN extra text;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_renamed_audit'
   AND column_name = 'extra';
+ column_name 
+-------------
+ extra
+(1 row)
 
 -- TRUNCATE trigger should also work after rename
 TRUNCATE public.test_orders_renamed;
-
 SELECT audit_operation
 FROM public.test_orders_renamed_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_renamed_audit);
+ audit_operation 
+-----------------
+ T
+(1 row)
 
 -- Rename back for cleanup
 ALTER TABLE public.test_orders_renamed RENAME TO test_orders;
+NOTICE:  pgaudix: renamed audit table to public.test_orders_audit
 ALTER TABLE public.test_orders DROP COLUMN extra;
-
 -- ============================================================
 -- Test 16: SPI error handling - audit failure aborts DML (C1)
 -- ============================================================
 -- Force an audit column mismatch by dropping a column from audit table directly
 -- (Disable DDL sync guard temporarily)
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
-SELECT pgaudix.enable('public.test_orders');
-TRUNCATE public.test_orders_audit;
+ disable 
+---------
+ 
+(1 row)
 
+SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
+
+TRUNCATE public.test_orders_audit;
 -- Drop a column from audit table to cause a mismatch
 -- The ddl_sync will fire and warn, but the DROP proceeds
 ALTER TABLE public.test_orders_audit DROP COLUMN status;
-
+WARNING:  pgaudix: direct ALTER on audit table is not recommended — changes may be overwritten by DDL sync
 -- Now INSERT should fail because the trigger tries to write to a missing column
 DO $$
 BEGIN
@@ -273,27 +392,47 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: INSERT aborted due to audit failure: %', SQLERRM;
 END;
 $$;
-
+NOTICE:  OK: INSERT aborted due to audit failure: column "status" of relation "test_orders_audit" does not exist
 -- Verify no row was inserted into the source table
 SELECT count(*) FROM public.test_orders WHERE amount = 999.99;
+ count 
+-------
+     0
+(1 row)
 
 -- ============================================================
 -- Test 17: NULL values in INSERT and UPDATE
 -- ============================================================
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
 
 INSERT INTO public.test_orders (amount, status) VALUES (NULL, NULL);
-
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | id | amount | status 
+-----------------+----+--------+--------
+ I               |  8 |        | 
+(1 row)
 
 UPDATE public.test_orders SET amount = 50.00 WHERE amount IS NULL;
-
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
+ audit_operation | id | amount  | status 
+-----------------+----+---------+--------
+ I               |  8 |         | 
+ U               |  8 | 50.0000 | 
+(2 rows)
 
 -- ============================================================
 -- Test 18: Multi-row UPDATE and DELETE
@@ -304,20 +443,25 @@ INSERT INTO public.test_orders (amount, status) VALUES (10.00, 'a');
 INSERT INTO public.test_orders (amount, status) VALUES (20.00, 'a');
 INSERT INTO public.test_orders (amount, status) VALUES (30.00, 'a');
 TRUNCATE public.test_orders_audit;
-
 -- UPDATE all 3 rows — should produce 3 audit rows
 UPDATE public.test_orders SET status = 'b';
-
 SELECT count(*) AS update_audit_rows
 FROM public.test_orders_audit
 WHERE audit_operation = 'U';
+ update_audit_rows 
+-------------------
+                 3
+(1 row)
 
 -- DELETE all 3 rows — should produce 3 audit rows
 DELETE FROM public.test_orders;
-
 SELECT count(*) AS delete_audit_rows
 FROM public.test_orders_audit
 WHERE audit_operation = 'D';
+ delete_audit_rows 
+-------------------
+                 3
+(1 row)
 
 -- ============================================================
 -- Test 19: Non-public schema
@@ -327,38 +471,53 @@ CREATE TABLE test_schema.items (
     id serial PRIMARY KEY,
     name text
 );
-
 SELECT pgaudix.enable('test_schema.items');
+ enable 
+--------
+ 
+(1 row)
 
 INSERT INTO test_schema.items (name) VALUES ('widget');
-
 SELECT audit_operation, audit_user, id, name
 FROM test_schema.items_audit
 ORDER BY audit_id;
+ audit_operation | audit_user | id |  name  
+-----------------+------------+----+--------
+ I               | postgres   |  1 | widget
+(1 row)
 
 -- DDL sync in non-public schema
 ALTER TABLE test_schema.items ADD COLUMN price numeric;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'test_schema' AND table_name = 'items_audit'
   AND column_name = 'price';
+ column_name 
+-------------
+ price
+(1 row)
 
 SELECT pgaudix.disable('test_schema.items', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
 DROP TABLE test_schema.items;
 DROP SCHEMA test_schema;
-
 -- ============================================================
 -- Test 20: Transaction rollback — no audit rows
 -- ============================================================
 TRUNCATE public.test_orders_audit;
-
 BEGIN;
     INSERT INTO public.test_orders (amount, status) VALUES (777.00, 'will_rollback');
 ROLLBACK;
-
 -- No audit row should exist for the rolled-back INSERT
 SELECT count(*) FROM public.test_orders_audit;
+ count 
+-------
+     0
+(1 row)
 
 -- ============================================================
 -- Test 21: Same audit_txid within a transaction
@@ -368,77 +527,117 @@ BEGIN;
     INSERT INTO public.test_orders (amount, status) VALUES (2.00, 'tx2');
     UPDATE public.test_orders SET status = 'tx_updated' WHERE amount = 1.00;
 COMMIT;
-
 -- All 3 audit rows in the same transaction should share the same txid
 SELECT count(DISTINCT audit_txid) AS distinct_txids
 FROM public.test_orders_audit;
+ distinct_txids 
+----------------
+              1
+(1 row)
 
 -- ============================================================
 -- Test 22: Disable then re-enable
 -- ============================================================
 -- Disable but keep audit data
 SELECT pgaudix.disable('public.test_orders');
+ disable 
+---------
+ 
+(1 row)
 
 -- Audit table should still have data
 SELECT count(*) > 0 AS has_data FROM public.test_orders_audit;
+ has_data 
+----------
+ t
+(1 row)
 
 -- DML after disable should NOT produce audit rows
 INSERT INTO public.test_orders (amount, status) VALUES (999.00, 'no_audit');
 SELECT count(*) AS rows_after_disable
 FROM public.test_orders_audit
 WHERE status = 'no_audit';
+ rows_after_disable 
+--------------------
+                  0
+(1 row)
 
 -- Drop stale audit table and re-enable
 DROP TABLE public.test_orders_audit;
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
 
 -- DML after re-enable should work
 INSERT INTO public.test_orders (amount, status) VALUES (888.00, 're_enabled');
-
 SELECT audit_operation, amount, status
 FROM public.test_orders_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+ audit_operation |  amount  |   status   
+-----------------+----------+------------
+ I               | 888.0000 | re_enabled
+(1 row)
 
 -- ============================================================
 -- Test 23: Multiple DDL changes in one ALTER
 -- ============================================================
 ALTER TABLE public.test_orders ADD COLUMN col_a text, ADD COLUMN col_b int;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name IN ('col_a', 'col_b')
 ORDER BY column_name;
+ column_name 
+-------------
+ col_a
+ col_b
+(2 rows)
 
 ALTER TABLE public.test_orders DROP COLUMN col_a, DROP COLUMN col_b;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name IN ('col_a', 'col_b')
 ORDER BY column_name;
+ column_name 
+-------------
+(0 rows)
 
 -- ============================================================
 -- Test 24: Source column with audit_ prefix
 -- ============================================================
 ALTER TABLE public.test_orders ADD COLUMN audit_notes text;
-
 -- Verify both the metadata audit_ columns and the mirrored audit_notes exist
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name LIKE 'audit_%'
 ORDER BY ordinal_position;
+    column_name    
+-------------------
+ audit_id
+ audit_operation
+ audit_timestamp
+ audit_txid
+ audit_user
+ audit_client_addr
+ audit_app_name
+ audit_notes
+(8 rows)
 
 INSERT INTO public.test_orders (amount, status, audit_notes)
 VALUES (42.00, 'noted', 'user note');
-
 SELECT audit_operation, amount, status, audit_notes
 FROM public.test_orders_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
+ audit_operation | amount  | status | audit_notes 
+-----------------+---------+--------+-------------
+ I               | 42.0000 | noted  | user note
+(1 row)
 
 ALTER TABLE public.test_orders DROP COLUMN audit_notes;
-
 -- ============================================================
 -- Test 25: Enable on non-existent table
 -- ============================================================
@@ -450,12 +649,11 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: enable on non-existent table failed: %', SQLERRM;
 END;
 $$;
-
+NOTICE:  OK: enable on non-existent table failed: relation "public.no_such_table" does not exist
 -- ============================================================
 -- Test 26: Disable on non-monitored table
 -- ============================================================
 CREATE TABLE public.unmonitored (id int);
-
 DO $$
 BEGIN
     PERFORM pgaudix.disable('public.unmonitored');
@@ -464,16 +662,19 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: disable on non-monitored table failed: %', SQLERRM;
 END;
 $$;
-
+NOTICE:  OK: disable on non-monitored table failed: pgaudix: table public.unmonitored is not monitored
 DROP TABLE public.unmonitored;
-
 -- ============================================================
 -- Test 27: Attnum gap alignment (enable on table with dropped columns)
 -- ============================================================
 -- Cleanup from previous tests
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
-DROP TABLE public.test_orders;
+ disable 
+---------
+ 
+(1 row)
 
+DROP TABLE public.test_orders;
 -- Create table with attnum gaps: add columns then drop them
 CREATE TABLE public.test_gaps (
     id      serial PRIMARY KEY,   -- attnum 1
@@ -482,9 +683,12 @@ CREATE TABLE public.test_gaps (
     col_c   text                  -- attnum 4
 );
 ALTER TABLE public.test_gaps DROP COLUMN col_b;  -- gap at attnum 3
-
 -- Enable auditing on table with gap
 SELECT pgaudix.enable('public.test_gaps');
+ enable 
+--------
+ 
+(1 row)
 
 -- Verify audit table has only non-dropped columns (not col_b)
 SELECT column_name
@@ -492,71 +696,103 @@ FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name NOT LIKE 'audit_%'
 ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ col_a
+ col_c
+(3 rows)
 
 -- DML should work with gaps
 INSERT INTO public.test_gaps (col_a, col_c) VALUES ('a1', 'c1');
 UPDATE public.test_gaps SET col_a = 'a2' WHERE col_a = 'a1';
 DELETE FROM public.test_gaps WHERE col_a = 'a2';
-
 SELECT audit_operation, id, col_a, col_c
 FROM public.test_gaps_audit
 ORDER BY audit_id;
+ audit_operation | id | col_a | col_c 
+-----------------+----+-------+-------
+ I               |  1 | a1    | c1
+ U               |  1 | a2    | c1
+ D               |  1 | a2    | c1
+(3 rows)
 
 -- DDL sync should work with gaps: ADD COLUMN
 ALTER TABLE public.test_gaps ADD COLUMN col_d text;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name = 'col_d';
+ column_name 
+-------------
+ col_d
+(1 row)
 
 -- DDL sync: RENAME COLUMN
 ALTER TABLE public.test_gaps RENAME COLUMN col_d TO col_d_renamed;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name = 'col_d_renamed';
+  column_name  
+---------------
+ col_d_renamed
+(1 row)
 
 -- DDL sync: ALTER COLUMN TYPE
 ALTER TABLE public.test_gaps ALTER COLUMN col_c TYPE varchar(100);
-
 SELECT column_name, data_type, character_maximum_length
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name = 'col_c';
+ column_name |     data_type     | character_maximum_length 
+-------------+-------------------+--------------------------
+ col_c       | character varying |                      100
+(1 row)
 
 -- DDL sync: DROP COLUMN
 ALTER TABLE public.test_gaps DROP COLUMN col_d_renamed;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name = 'col_d_renamed';
+ column_name 
+-------------
+(0 rows)
 
 -- Multiple non-contiguous gaps: drop another column and add new ones
 ALTER TABLE public.test_gaps DROP COLUMN col_a;  -- gap at attnums 2 and 3
-
 ALTER TABLE public.test_gaps ADD COLUMN col_e text;
 ALTER TABLE public.test_gaps ADD COLUMN col_f text;
-
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_gaps_audit'
   AND column_name IN ('col_e', 'col_f')
 ORDER BY column_name;
+ column_name 
+-------------
+ col_e
+ col_f
+(2 rows)
 
 -- Full DML cycle after multiple gaps
 INSERT INTO public.test_gaps (col_c, col_e, col_f) VALUES ('cc', 'ee', 'ff');
-
 SELECT audit_operation, col_c, col_e, col_f
 FROM public.test_gaps_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_gaps_audit);
+ audit_operation | col_c | col_e | col_f 
+-----------------+-------+-------+-------
+ I               | cc    | ee    | ff
+(1 row)
 
 -- Cleanup test_gaps
 SELECT pgaudix.disable('public.test_gaps', drop_data := true);
-DROP TABLE public.test_gaps;
+ disable 
+---------
+ 
+(1 row)
 
+DROP TABLE public.test_gaps;
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (
     id      serial PRIMARY KEY,
@@ -564,10 +800,19 @@ CREATE TABLE public.test_orders (
     status  text
 );
 SELECT pgaudix.enable('public.test_orders');
+ enable 
+--------
+ 
+(1 row)
 
 -- ============================================================
 -- Cleanup
 -- ============================================================
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
 DROP TABLE public.test_orders;
 DROP EXTENSION pgaudix;

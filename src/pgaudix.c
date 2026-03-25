@@ -7,33 +7,12 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
 
-/* GUC: whether to capture current_query() in audit rows */
-static bool pgaudix_log_query = false;
-
-void _PG_init(void);
-
 PG_FUNCTION_INFO_V1(pgaudix_trigger);
-
-void
-_PG_init(void)
-{
-	DefineCustomBoolVariable(
-		"pgaudix.log_query",
-		"Log the SQL query text in audit records.",
-		NULL,
-		&pgaudix_log_query,
-		false,
-		PGC_SUSET,
-		0,
-		NULL, NULL, NULL
-	);
-}
 
 /*
  * Insert one audit row into the audit table.
@@ -73,6 +52,7 @@ insert_audit_row(const char *operation, HeapTuple tuple, TupleDesc tupdesc,
 	 */
 	nparams = 1 + ncols;
 
+	/* palloc never returns NULL — it ereports on OOM */
 	values = (Datum *) palloc(nparams * sizeof(Datum));
 	types = (Oid *) palloc(nparams * sizeof(Oid));
 	nulls = (char *) palloc(nparams * sizeof(char));
@@ -128,8 +108,14 @@ insert_audit_row(const char *operation, HeapTuple tuple, TupleDesc tupdesc,
 					 "INSERT INTO %s (%s) VALUES (%s)",
 					 audit_table, cols.data, vals.data);
 
-	if (SPI_execute_with_args(query.data, nparams, types, values, nulls, false, 0) < 0)
-		elog(ERROR, "pgaudix: failed to insert audit row into %s", audit_table);
+	{
+		int	ret;
+
+		ret = SPI_execute_with_args(query.data, nparams, types, values, nulls,
+									false, 0);
+		if (ret != SPI_OK_INSERT)
+			elog(ERROR, "pgaudix: audit INSERT failed (SPI returned %d)", ret);
+	}
 
 	pfree(cols.data);
 	pfree(vals.data);
@@ -172,16 +158,78 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 		elog(ERROR, "pgaudix_trigger: must have audit table name as argument");
 	audit_table = trigdata->tg_trigger->tgargs[0];
 
+	/*
+	 * Validate the audit table argument looks like a quoted "schema"."table"
+	 * identifier. This prevents SQL injection if someone tampers with
+	 * pg_trigger.tgargs directly. The enable() function always produces
+	 * this form using explicit double-quoting.
+	 */
+	{
+		const char *p = audit_table;
+
+		if (*p != '"')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+
+		/* scan past first quoted identifier (handles "" escape) */
+		p++;
+		while (*p)
+		{
+			if (*p == '"')
+			{
+				if (*(p + 1) == '"')	/* escaped "" */
+				{
+					p += 2;
+					continue;
+				}
+				break;					/* closing quote */
+			}
+			p++;
+		}
+		if (*p != '"')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+		p++;
+
+		/* expect a dot separator */
+		if (*p != '.')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+		p++;
+
+		/* second quoted identifier */
+		if (*p != '"')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+		p++;
+		while (*p)
+		{
+			if (*p == '"')
+			{
+				if (*(p + 1) == '"')
+				{
+					p += 2;
+					continue;
+				}
+				break;
+			}
+			p++;
+		}
+		if (*p != '"')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+		p++;
+
+		/* must be end of string */
+		if (*p != '\0')
+			elog(ERROR, "pgaudix_trigger: invalid audit table name format");
+	}
+
 	tupdesc = trigdata->tg_relation->rd_att;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "pgaudix: SPI_connect failed");
+		elog(ERROR, "pgaudix_trigger: SPI_connect failed");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 	{
-		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_newtuple, tupdesc,
+		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_trigtuple, tupdesc,
 						 audit_table);
-		rettuple = trigdata->tg_newtuple;
+		rettuple = trigdata->tg_trigtuple;
 	}
 	else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
 	{
@@ -201,8 +249,7 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 		rettuple = NULL; /* keep compiler quiet */
 	}
 
-	if (SPI_finish() != SPI_OK_FINISH)
-		elog(ERROR, "pgaudix: SPI_finish failed");
+	SPI_finish();
 
 	return PointerGetDatum(rettuple);
 }

@@ -63,10 +63,11 @@ WHERE audit_user = 'app_service';
 
 ## Operations reference
 
-| `audit_operation` | Meaning | Row contains |
-|-------------------|---------|--------------|
-| `I`               | INSERT  | New values   |
-| `U`               | UPDATE  | New values   |
-| `D`               | DELETE  | Old values   |
+| `audit_operation` | Meaning  | Row contains         |
+|-------------------|----------|----------------------|
+| `I`               | INSERT   | New values           |
+| `U`               | UPDATE   | New values           |
+| `D`               | DELETE   | Old values           |
+| `T`               | TRUNCATE | NULLs (no row data)  |
 
 > The "before" values of any UPDATE are the previous audit row for that record.
