@@ -27,8 +27,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential postgresql-server-dev-${{ matrix.pg_version }}
 
-      - name: Build extension
-        run: make USE_PGXS=1
+      - name: Build and install extension
+        run: make USE_PGXS=1 && make USE_PGXS=1 install
 
       - name: Run tests
         run: |
@@ -58,12 +58,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [17, 16]
+        pg_version: [17]
         include:
           - pg_version: 17
             choco_version: '17.4.0'
-          - pg_version: 16
-            choco_version: '16.8.0'
 
     steps:
       - uses: actions/checkout@v4
@@ -84,8 +82,12 @@ jobs:
       - name: Build extension
         shell: msys2 {0}
         run: |
-          export PG_CONFIG="/c/Program Files/PostgreSQL/${{ matrix.pg_version }}/bin/pg_config"
-          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+          PG_CONFIG="/c/Program Files/PostgreSQL/${{ matrix.pg_version }}/bin/pg_config"
+          # Create a wrapper to avoid spaces-in-path issues with Make
+          echo "#!/bin/sh" > /tmp/pg_config
+          echo "exec \"$PG_CONFIG\" \"\$@\"" >> /tmp/pg_config
+          chmod +x /tmp/pg_config
+          make USE_PGXS=1 PG_CONFIG=/tmp/pg_config
 
       - name: Package release
         shell: bash
