@@ -10,9 +10,9 @@ CREATE TABLE public.test_orders (
     status  text
 );
 SELECT pgaudix.enable('public.test_orders');
- enable
+ enable 
 --------
-
+ 
 (1 row)
 
 -- Verify audit table exists
@@ -20,7 +20,7 @@ SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
 ORDER BY ordinal_position;
-    column_name    |        data_type
+    column_name    |        data_type         
 -------------------+--------------------------
  audit_id          | bigint
  audit_operation   | character
@@ -37,7 +37,7 @@ ORDER BY ordinal_position;
 -- Verify registration
 SELECT source_schema, source_table, audit_table, enabled
 FROM pgaudix.status();
- source_schema | source_table |    audit_table    | enabled
+ source_schema | source_table |    audit_table    | enabled 
 ---------------+--------------+-------------------+---------
  public        | test_orders  | test_orders_audit | t
 (1 row)
@@ -49,7 +49,7 @@ INSERT INTO public.test_orders (amount, status) VALUES (100.50, 'pending');
 SELECT audit_operation, audit_user, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
- audit_operation | audit_user | id | amount | status
+ audit_operation | audit_user | id | amount | status  
 -----------------+------------+----+--------+---------
  I               | postgres   |  1 | 100.50 | pending
 (1 row)
@@ -61,7 +61,7 @@ UPDATE public.test_orders SET status = 'shipped', amount = 105.00 WHERE id = 1;
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
- audit_operation | id | amount | status
+ audit_operation | id | amount | status  
 -----------------+----+--------+---------
  I               |  1 | 100.50 | pending
  U               |  1 | 105.00 | shipped
@@ -74,7 +74,7 @@ DELETE FROM public.test_orders WHERE id = 1;
 SELECT audit_operation, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
- audit_operation | id | amount | status
+ audit_operation | id | amount | status  
 -----------------+----+--------+---------
  I               |  1 | 100.50 | pending
  U               |  1 | 105.00 | shipped
@@ -90,7 +90,7 @@ SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'notes';
- column_name | data_type
+ column_name | data_type 
 -------------+-----------
  notes       | text
 (1 row)
@@ -100,7 +100,7 @@ INSERT INTO public.test_orders (amount, status, notes) VALUES (200.00, 'new', 't
 SELECT audit_operation, amount, status, notes
 FROM public.test_orders_audit
 WHERE audit_id = (SELECT max(audit_id) FROM public.test_orders_audit);
- audit_operation | amount | status |   notes
+ audit_operation | amount | status |   notes   
 -----------------+--------+--------+-----------
  I               | 200.00 | new    | test note
 (1 row)
@@ -113,7 +113,7 @@ SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'description';
- column_name
+ column_name 
 -------------
  description
 (1 row)
@@ -126,7 +126,7 @@ SELECT column_name, numeric_precision, numeric_scale
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'amount';
- column_name | numeric_precision | numeric_scale
+ column_name | numeric_precision | numeric_scale 
 -------------+-------------------+---------------
  amount      |                12 |             4
 (1 row)
@@ -139,7 +139,7 @@ SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
   AND column_name = 'description';
- column_name
+ column_name 
 -------------
 (0 rows)
 
@@ -147,16 +147,16 @@ WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
 -- Test 9: Disable auditing (keep data)
 -- ============================================================
 SELECT pgaudix.disable('public.test_orders');
- disable
+ disable 
 ---------
-
+ 
 (1 row)
 
 -- Trigger should be gone
 SELECT count(*) FROM pg_trigger
 WHERE tgname = 'pgaudix_audit_trigger'
   AND tgrelid = 'public.test_orders'::regclass;
- count
+ count 
 -------
      0
 (1 row)
@@ -164,7 +164,7 @@ WHERE tgname = 'pgaudix_audit_trigger'
 -- Audit table should still exist
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
- count
+ count 
 -------
      1
 (1 row)
@@ -174,21 +174,21 @@ WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
 -- ============================================================
 DROP TABLE IF EXISTS public.test_orders_audit;
 SELECT pgaudix.enable('public.test_orders');
- enable
+ enable 
 --------
-
+ 
 (1 row)
 
 SELECT pgaudix.disable('public.test_orders', drop_data := true);
- disable
+ disable 
 ---------
-
+ 
 (1 row)
 
 -- Audit table should be gone
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'public' AND table_name = 'test_orders_audit';
- count
+ count 
 -------
      0
 (1 row)
