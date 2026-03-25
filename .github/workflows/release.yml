@@ -67,6 +67,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-postgresql
             make
+            zip
 
       - name: Build extension
         shell: msys2 {0}
@@ -78,7 +79,6 @@ jobs:
       - name: Package release
         shell: msys2 {0}
         run: |
-          pacman -S --noconfirm zip
           PG_VERSION=$(pg_config --version | grep -oP '\d+')
           VERSION="${GITHUB_REF_NAME#v}"
           DIST="pgaudix-${VERSION}-pg${PG_VERSION}-windows-amd64"
