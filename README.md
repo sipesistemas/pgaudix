@@ -182,8 +182,8 @@ SELECT pgaudix.disable('orders', drop_data := true);
 
 | Function | Description |
 |----------|-------------|
-| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and trigger. |
-| `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. |
+| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and trigger. Caller must have `TRIGGER` privilege on the table. |
+| `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. Caller must have `TRIGGER` privilege on the table. |
 | `pgaudix.status()` | List all monitored tables with their status. |
 
 ## Development
@@ -240,6 +240,7 @@ pgaudix/
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table
 - Maximum of ~796 columns per source table (audit table has mirrored columns + 7 metadata columns, PostgreSQL limit is 1600)
+- Auditing cannot be enabled for `information_schema`, `pgaudix`, or any schema starting with `pg_`
 
 ## License
 
