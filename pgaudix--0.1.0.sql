@@ -66,17 +66,36 @@ DECLARE
     v_audit_fqn text;
     v_audit_tgarg text;
     v_cols      text := '';
+    v_relkind   "char";
     rec         record;
 BEGIN
     -- Serialize concurrent enable() calls (H3)
     LOCK TABLE pgaudix.monitored_tables IN EXCLUSIVE MODE;
 
-    -- Resolve schema and table name
-    SELECT n.nspname, c.relname
-    INTO v_schema, v_table
+    -- Resolve schema, table name and relkind
+    SELECT n.nspname, c.relname, c.relkind
+    INTO v_schema, v_table, v_relkind
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
     WHERE c.oid = target_table;
+
+    -- Reject views, materialized views, foreign tables, indexes, sequences, etc. (A5)
+    -- Only ordinary tables ('r') and partitioned tables ('p') are supported.
+    IF v_relkind NOT IN ('r', 'p') THEN
+        RAISE EXCEPTION 'pgaudix: %.% is not a regular or partitioned table (relkind=%)',
+            v_schema, v_table, v_relkind;
+    END IF;
+
+    -- Reject system catalogs to avoid catastrophic side effects
+    IF v_schema IN ('pg_catalog', 'information_schema') OR v_schema LIKE 'pg\_%' ESCAPE '\' THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit system table %.%', v_schema, v_table;
+    END IF;
+
+    -- Reject names that would silently truncate to NAMEDATALEN-1 (A1)
+    IF length(v_table::text) + length('_audit') > 63 THEN
+        RAISE EXCEPTION 'pgaudix: source table name % is too long (audit table name would exceed 63 chars)',
+            v_table;
+    END IF;
 
     v_audit := v_table || '_audit';
     v_audit_fqn := format('%I.%I', v_schema, v_audit);
@@ -128,7 +147,7 @@ BEGIN
     EXECUTE format(
         'CREATE TABLE %s ('
         '    audit_id            bigserial PRIMARY KEY,'
-        '    audit_operation     char(1) NOT NULL,'
+        '    audit_operation     char(1) NOT NULL CHECK (audit_operation IN (''I'',''U'',''D'',''T'')),'
         '    audit_timestamp     timestamptz NOT NULL DEFAULT clock_timestamp(),'
         '    audit_txid          bigint NOT NULL DEFAULT txid_current(),'
         '    audit_user          name NOT NULL DEFAULT session_user,'
@@ -159,9 +178,9 @@ BEGIN
         'CREATE INDEX ON %s (audit_timestamp)', v_audit_fqn
     );
 
-    -- Restrict direct modification of audit table (M2)
+    -- Restrict direct modification of audit table (M2, A6)
     EXECUTE format(
-        'REVOKE INSERT, UPDATE, DELETE ON %s FROM PUBLIC',
+        'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON %s FROM PUBLIC',
         v_audit_fqn
     );
 
@@ -254,21 +273,42 @@ $func$;
 
 CREATE FUNCTION pgaudix.status()
 RETURNS TABLE (
-    source_schema   name,
-    source_table    name,
-    audit_schema    name,
-    audit_table     name,
-    enabled         boolean,
-    created_at      timestamptz
+    source_schema           name,
+    source_table            name,
+    audit_schema            name,
+    audit_table             name,
+    enabled                 boolean,
+    created_at              timestamptz,
+    audit_table_exists      boolean,
+    dml_trigger_exists      boolean,
+    truncate_trigger_exists boolean
 )
 LANGUAGE sql
 STABLE
 SET search_path = pgaudix, pg_catalog
 AS $func$
-    SELECT source_schema, source_table, audit_schema, audit_table,
-           enabled, created_at
-    FROM pgaudix.monitored_tables
-    ORDER BY source_schema, source_table;
+    SELECT
+        mt.source_schema, mt.source_table, mt.audit_schema, mt.audit_table,
+        mt.enabled, mt.created_at,
+        EXISTS (
+            SELECT 1 FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = mt.audit_schema AND c.relname = mt.audit_table
+        ) AS audit_table_exists,
+        EXISTS (
+            SELECT 1 FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid = mt.source_oid
+              AND t.tgname = 'pgaudix_audit_trigger'
+              AND NOT t.tgisinternal
+        ) AS dml_trigger_exists,
+        EXISTS (
+            SELECT 1 FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid = mt.source_oid
+              AND t.tgname = 'pgaudix_truncate_trigger'
+              AND NOT t.tgisinternal
+        ) AS truncate_trigger_exists
+    FROM pgaudix.monitored_tables mt
+    ORDER BY mt.source_schema, mt.source_table;
 $func$;
 
 -- ============================================================
@@ -300,6 +340,76 @@ BEGIN
     END IF;
     PERFORM set_config('pgaudix.in_ddl_sync', 'true', true);
 
+    -- ----------------------------------------------------------------
+    -- Pre-pass: sync source_schema / source_table / audit_schema /
+    -- audit_table for every monitored entry whose current pg_class
+    -- name no longer matches the registration. Covers RENAME TABLE,
+    -- SET SCHEMA and ALTER SCHEMA RENAME (A2, H2).
+    -- ----------------------------------------------------------------
+    FOR mon IN
+        SELECT mt.* FROM pgaudix.monitored_tables mt WHERE mt.enabled
+    LOOP
+        SELECT n.nspname, c.relname
+        INTO v_new_schema, v_new_table
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+        WHERE c.oid = mon.source_oid;
+
+        -- Source dropped — drop_cleanup will remove the row
+        CONTINUE WHEN v_new_schema IS NULL;
+
+        IF v_new_schema = mon.source_schema AND v_new_table = mon.source_table THEN
+            CONTINUE;
+        END IF;
+
+        v_new_audit := v_new_table || '_audit';
+
+        -- Rename audit table if source table renamed (audit lives in same
+        -- schema as source, which moves automatically with ALTER SCHEMA RENAME)
+        IF v_new_audit != mon.audit_table THEN
+            EXECUTE format(
+                'ALTER TABLE %I.%I RENAME TO %I',
+                v_new_schema, mon.audit_table, v_new_audit
+            );
+        END IF;
+
+        -- Recreate DML trigger so its tgarg points at the new audit qualified name
+        EXECUTE format(
+            'DROP TRIGGER IF EXISTS pgaudix_audit_trigger ON %I.%I',
+            v_new_schema, v_new_table
+        );
+
+        v_new_tgarg := '"' || replace(v_new_schema::text, '"', '""')
+                    || '"."' || replace(v_new_audit::text, '"', '""') || '"';
+
+        EXECUTE format(
+            'CREATE TRIGGER pgaudix_audit_trigger '
+            'AFTER INSERT OR UPDATE OR DELETE ON %I.%I '
+            'FOR EACH ROW EXECUTE FUNCTION pgaudix.audit_trigger(%L)',
+            v_new_schema, v_new_table, v_new_tgarg
+        );
+
+        EXECUTE format(
+            'DROP TRIGGER IF EXISTS pgaudix_truncate_trigger ON %I.%I',
+            v_new_schema, v_new_table
+        );
+
+        EXECUTE format(
+            'CREATE TRIGGER pgaudix_truncate_trigger '
+            'AFTER TRUNCATE ON %I.%I '
+            'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
+            v_new_schema, v_new_table, v_new_schema, v_new_audit
+        );
+
+        UPDATE pgaudix.monitored_tables
+        SET source_schema = v_new_schema, source_table = v_new_table,
+            audit_schema = v_new_schema, audit_table = v_new_audit
+        WHERE id = mon.id;
+
+        RAISE NOTICE 'pgaudix: synchronized audit registration to %.%',
+            v_new_schema, v_new_audit;
+    END LOOP;
+
     FOR cmd IN
         SELECT *
         FROM pg_event_trigger_ddl_commands()
@@ -323,7 +433,8 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Look up monitored table by OID (H2)
+        -- Look up monitored table by OID (H2). After the pre-pass above,
+        -- mon.source_schema / source_table reflect the current names.
         SELECT mt.*
         INTO mon
         FROM pgaudix.monitored_tables mt
@@ -331,76 +442,6 @@ BEGIN
 
         IF NOT FOUND THEN
             CONTINUE;
-        END IF;
-
-        -- Detect and handle RENAME TABLE / SET SCHEMA (H2)
-        SELECT n.nspname, c.relname
-        INTO v_new_schema, v_new_table
-        FROM pg_catalog.pg_class c
-        JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-        WHERE c.oid = v_source_oid;
-
-        IF v_new_schema != mon.source_schema OR v_new_table != mon.source_table THEN
-            v_new_audit := v_new_table || '_audit';
-
-            -- Rename the audit table to match
-            IF v_new_audit != mon.audit_table THEN
-                EXECUTE format(
-                    'ALTER TABLE %I.%I RENAME TO %I',
-                    mon.audit_schema, mon.audit_table, v_new_audit
-                );
-            END IF;
-
-            -- Move audit table to new schema if schema changed
-            IF v_new_schema != mon.audit_schema THEN
-                EXECUTE format(
-                    'ALTER TABLE %I.%I SET SCHEMA %I',
-                    mon.audit_schema, v_new_audit, v_new_schema
-                );
-            END IF;
-
-            -- Recreate DML trigger with updated audit table reference
-            EXECUTE format(
-                'DROP TRIGGER IF EXISTS pgaudix_audit_trigger ON %I.%I',
-                v_new_schema, v_new_table
-            );
-
-            v_new_tgarg := '"' || replace(v_new_schema::text, '"', '""')
-                        || '"."' || replace(v_new_audit::text, '"', '""') || '"';
-
-            EXECUTE format(
-                'CREATE TRIGGER pgaudix_audit_trigger '
-                'AFTER INSERT OR UPDATE OR DELETE ON %I.%I '
-                'FOR EACH ROW EXECUTE FUNCTION pgaudix.audit_trigger(%L)',
-                v_new_schema, v_new_table, v_new_tgarg
-            );
-
-            -- Recreate TRUNCATE trigger with updated arguments
-            EXECUTE format(
-                'DROP TRIGGER IF EXISTS pgaudix_truncate_trigger ON %I.%I',
-                v_new_schema, v_new_table
-            );
-
-            EXECUTE format(
-                'CREATE TRIGGER pgaudix_truncate_trigger '
-                'AFTER TRUNCATE ON %I.%I '
-                'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
-                v_new_schema, v_new_table, v_new_schema, v_new_audit
-            );
-
-            -- Update registration
-            UPDATE pgaudix.monitored_tables
-            SET source_schema = v_new_schema, source_table = v_new_table,
-                audit_schema = v_new_schema, audit_table = v_new_audit
-            WHERE id = mon.id;
-
-            mon.source_schema := v_new_schema;
-            mon.source_table := v_new_table;
-            mon.audit_schema := v_new_schema;
-            mon.audit_table := v_new_audit;
-
-            RAISE NOTICE 'pgaudix: renamed audit table to %.%',
-                v_new_schema, v_new_audit;
         END IF;
 
         v_audit_fqn := format('%I.%I', mon.audit_schema, mon.audit_table);
@@ -411,11 +452,21 @@ BEGIN
         JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
         WHERE n.nspname = mon.audit_schema AND c.relname = mon.audit_table;
 
+        IF v_audit_oid IS NULL THEN
+            RAISE EXCEPTION 'pgaudix: audit table %.% is missing — cannot sync DDL',
+                mon.audit_schema, mon.audit_table;
+        END IF;
+
         SELECT a.attnum INTO v_offset
         FROM pg_catalog.pg_attribute a
         WHERE a.attrelid = v_audit_oid
           AND a.attname = 'audit_app_name'
           AND NOT a.attisdropped;
+
+        IF v_offset IS NULL THEN
+            RAISE EXCEPTION 'pgaudix: audit table % is corrupted (audit_app_name column missing) — cannot sync DDL',
+                v_audit_fqn;
+        END IF;
 
         -- --------------------------------------------------------
         -- Detect ADDED columns
@@ -513,5 +564,33 @@ $func$;
 -- Create the event trigger
 CREATE EVENT TRIGGER pgaudix_ddl_sync
     ON ddl_command_end
-    WHEN TAG IN ('ALTER TABLE')
+    WHEN TAG IN ('ALTER TABLE', 'ALTER SCHEMA')
     EXECUTE FUNCTION pgaudix.ddl_sync();
+
+-- ============================================================
+-- DROP cleanup: remove monitored_tables row when source is dropped (A3)
+-- ============================================================
+
+CREATE FUNCTION pgaudix.drop_cleanup()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgaudix, pg_catalog
+AS $func$
+DECLARE
+    obj record;
+BEGIN
+    FOR obj IN
+        SELECT objid
+        FROM pg_event_trigger_dropped_objects()
+        WHERE object_type = 'table'
+    LOOP
+        DELETE FROM pgaudix.monitored_tables
+        WHERE source_oid = obj.objid;
+    END LOOP;
+END;
+$func$;
+
+CREATE EVENT TRIGGER pgaudix_drop_cleanup
+    ON sql_drop
+    EXECUTE FUNCTION pgaudix.drop_cleanup();
