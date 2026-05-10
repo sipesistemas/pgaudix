@@ -557,6 +557,170 @@ WHERE audit_id = (SELECT max(audit_id) FROM public.test_gaps_audit);
 SELECT pgaudix.disable('public.test_gaps', drop_data := true);
 DROP TABLE public.test_gaps;
 
+-- ============================================================
+-- Test 28: A6 — REVOKE includes TRUNCATE
+-- ============================================================
+-- The enable() function must REVOKE TRUNCATE in addition to INSERT/UPDATE/DELETE
+-- so a future GRANT TRUNCATE TO PUBLIC is reset on re-enable.
+SELECT prosrc LIKE '%REVOKE INSERT, UPDATE, DELETE, TRUNCATE%' AS revoke_includes_truncate
+FROM pg_proc
+WHERE proname = 'enable' AND pronamespace = 'pgaudix'::regnamespace;
+
+-- ============================================================
+-- Test 29: A4 — v_offset NULL is detected and reported
+-- ============================================================
+CREATE TABLE public.test_a4 (id int, v text);
+SELECT pgaudix.enable('public.test_a4');
+
+-- Manually drop audit_app_name to force v_offset = NULL on next ddl_sync
+ALTER TABLE public.test_a4_audit DROP COLUMN audit_app_name;
+
+DO $$
+BEGIN
+    ALTER TABLE public.test_a4 ADD COLUMN x int;
+    RAISE NOTICE 'ERROR: ALTER should have failed (v_offset NULL undetected)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: % ', SQLERRM;
+END;
+$$;
+
+-- Cleanup
+SELECT pgaudix.disable('public.test_a4', drop_data := true);
+DROP TABLE public.test_a4;
+
+-- ============================================================
+-- Test 30: A5 — enable() rejects views and materialized views
+-- ============================================================
+CREATE VIEW public.test_a5_view AS SELECT 1 AS v;
+
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_a5_view');
+    RAISE NOTICE 'ERROR: enable on view should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: enable on view rejected: %', SQLERRM;
+END;
+$$;
+
+DROP VIEW public.test_a5_view;
+
+CREATE MATERIALIZED VIEW public.test_a5_mv AS SELECT 1 AS v;
+
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_a5_mv');
+    RAISE NOTICE 'ERROR: enable on materialized view should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: enable on materialized view rejected: %', SQLERRM;
+END;
+$$;
+
+DROP MATERIALIZED VIEW public.test_a5_mv;
+
+-- ============================================================
+-- Test 31: A1 — enable() rejects names that would overflow NAMEDATALEN
+-- ============================================================
+-- Source name 58 chars + '_audit' (6) = 64 > 63
+CREATE TABLE public.tab_with_a_name_so_long_it_definitely_overflows_namedatalen (id int);
+
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.tab_with_a_name_so_long_it_definitely_overflows_namedatalen');
+    RAISE NOTICE 'ERROR: enable on overlong name should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: enable on overlong name rejected: %', SQLERRM;
+END;
+$$;
+
+DROP TABLE public.tab_with_a_name_so_long_it_definitely_overflows_namedatalen;
+
+-- ============================================================
+-- Test 32: M6 — CHECK constraint on audit_operation
+-- ============================================================
+CREATE TABLE public.test_m6 (id int);
+SELECT pgaudix.enable('public.test_m6');
+
+-- As superuser we bypass REVOKE, but CHECK constraint must reject invalid op
+DO $$
+BEGIN
+    EXECUTE 'INSERT INTO public.test_m6_audit (audit_operation) VALUES (''X'')';
+    RAISE NOTICE 'ERROR: invalid audit_operation should have been rejected';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: invalid audit_operation rejected by CHECK constraint';
+END;
+$$;
+
+SELECT pgaudix.disable('public.test_m6', drop_data := true);
+DROP TABLE public.test_m6;
+
+-- ============================================================
+-- Test 33: A3 — DROP TABLE on source removes monitored_tables row
+-- ============================================================
+CREATE TABLE public.test_a3 (id int);
+SELECT pgaudix.enable('public.test_a3');
+
+-- Drop the source table directly
+DROP TABLE public.test_a3;
+
+-- After source DROP, monitored_tables should not have an orphaned row
+SELECT count(*) AS orphan_rows
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_a3';
+
+-- Audit table is also cleaned up (or at least no orphan registration)
+DROP TABLE IF EXISTS public.test_a3_audit;
+
+-- ============================================================
+-- Test 34: A2 — ALTER SCHEMA RENAME keeps audit in sync
+-- ============================================================
+CREATE SCHEMA test_a2_old;
+CREATE TABLE test_a2_old.tab (id int, v text);
+SELECT pgaudix.enable('test_a2_old.tab');
+
+-- Rename the schema
+ALTER SCHEMA test_a2_old RENAME TO test_a2_new;
+
+-- Now ALTER on the source must still sync the audit table (which lives in the renamed schema)
+ALTER TABLE test_a2_new.tab ADD COLUMN x int;
+
+-- The audit table in the new schema should have column x
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'test_a2_new' AND table_name = 'tab_audit'
+  AND column_name = 'x';
+
+-- monitored_tables should reflect the new schema name
+SELECT source_schema, audit_schema
+FROM pgaudix.status()
+WHERE source_table = 'tab';
+
+SELECT pgaudix.disable('test_a2_new.tab', drop_data := true);
+DROP TABLE test_a2_new.tab;
+DROP SCHEMA test_a2_new;
+
+-- ============================================================
+-- Test 35: M4 — status() reports integrity of audit objects
+-- ============================================================
+CREATE TABLE public.test_m4 (id int);
+SELECT pgaudix.enable('public.test_m4');
+
+-- Healthy state: all three integrity columns true
+SELECT audit_table_exists, dml_trigger_exists, truncate_trigger_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_m4';
+
+-- Drop the audit table directly (DROP TABLE doesn't fire ddl_sync filter)
+DROP TABLE public.test_m4_audit;
+
+-- status() should now report audit_table_exists = false
+SELECT audit_table_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_m4';
+
+-- Cleanup (disable accepts missing audit table)
+SELECT pgaudix.disable('public.test_m4');
+DROP TABLE public.test_m4;
+
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (
     id      serial PRIMARY KEY,
