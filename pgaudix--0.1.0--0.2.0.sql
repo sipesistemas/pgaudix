@@ -1,0 +1,23 @@
+-- pgaudix upgrade script: 0.1.0 -> 0.2.0
+--
+-- Applied by: ALTER EXTENSION pgaudix UPDATE TO '0.2.0';
+--
+-- This script contains ONLY the delta between 0.1.0 and 0.2.0.
+-- It must bring an existing 0.1.0 installation to the exact same state
+-- that a fresh install of pgaudix--0.2.0.sql produces.
+--
+-- Rules of thumb:
+--   * New table/column      -> CREATE TABLE / ALTER TABLE ... ADD COLUMN
+--   * Changed function body  -> CREATE OR REPLACE FUNCTION (full new definition)
+--   * Dropped object         -> DROP ... IF EXISTS
+--   * Never assume order: objects may already exist if partially applied.
+--
+-- Do NOT add the `\echo ... \quit` guard here — upgrade scripts run inside
+-- ALTER EXTENSION, not via psql \i.
+
+-- ============================================================
+-- 0.1.0 -> 0.2.0 changes
+-- ============================================================
+
+-- (No changes yet. Add the delta here as 0.2.0 work lands, and mirror
+--  every change into pgaudix--0.2.0.sql so fresh installs stay in sync.)
