@@ -29,7 +29,7 @@ FROM pgaudix.status();
 -- ============================================================
 INSERT INTO public.test_orders (amount, status) VALUES (100.50, 'pending');
 
-SELECT audit_operation, audit_user, id, amount, status
+SELECT audit_operation, audit_user = session_user AS correct_user, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
 
@@ -332,7 +332,7 @@ SELECT pgaudix.enable('test_schema.items');
 
 INSERT INTO test_schema.items (name) VALUES ('widget');
 
-SELECT audit_operation, audit_user, id, name
+SELECT audit_operation, audit_user = session_user AS correct_user, id, name
 FROM test_schema.items_audit
 ORDER BY audit_id;
 

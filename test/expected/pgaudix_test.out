@@ -46,12 +46,12 @@ FROM pgaudix.status();
 -- Test 2: INSERT audit
 -- ============================================================
 INSERT INTO public.test_orders (amount, status) VALUES (100.50, 'pending');
-SELECT audit_operation, audit_user, id, amount, status
+SELECT audit_operation, audit_user = session_user AS correct_user, id, amount, status
 FROM public.test_orders_audit
 ORDER BY audit_id;
- audit_operation | audit_user | id | amount | status  
------------------+------------+----+--------+---------
- I               | postgres   |  1 | 100.50 | pending
+ audit_operation | correct_user | id | amount | status  
+-----------------+--------------+----+--------+---------
+ I               | t            |  1 | 100.50 | pending
 (1 row)
 
 -- ============================================================
@@ -478,12 +478,12 @@ SELECT pgaudix.enable('test_schema.items');
 (1 row)
 
 INSERT INTO test_schema.items (name) VALUES ('widget');
-SELECT audit_operation, audit_user, id, name
+SELECT audit_operation, audit_user = session_user AS correct_user, id, name
 FROM test_schema.items_audit
 ORDER BY audit_id;
- audit_operation | audit_user | id |  name  
------------------+------------+----+--------
- I               | postgres   |  1 | widget
+ audit_operation | correct_user | id |  name  
+-----------------+--------------+----+--------
+ I               | t            |  1 | widget
 (1 row)
 
 -- DDL sync in non-public schema
