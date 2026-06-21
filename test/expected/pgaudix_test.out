@@ -874,7 +874,7 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: enable on overlong name rejected: %', SQLERRM;
 END;
 $$;
-NOTICE:  OK: enable on overlong name rejected: pgaudix: source table name tab_with_a_name_so_long_it_definitely_overflows_namedatalen is too long (audit table name would exceed 63 chars)
+NOTICE:  OK: enable on overlong name rejected: pgaudix: source table name tab_with_a_name_so_long_it_definitely_overflows_namedatalen is too long (audit table name would exceed 63 bytes)
 DROP TABLE public.tab_with_a_name_so_long_it_definitely_overflows_namedatalen;
 -- ============================================================
 -- Test 32: M6 — CHECK constraint on audit_operation
