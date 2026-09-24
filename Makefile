@@ -2,7 +2,7 @@ EXTENSION    = pgaudix
 MODULE_big   = pgaudix
 OBJS         = src/pgaudix.o
 
-DATA         = pgaudix--0.2.0.sql
+DATA         = pgaudix--0.3.0.sql
 PGFILEDESC   = "pgaudix - automatic table auditing with column mirroring"
 
 REGRESS      = pgaudix_test
@@ -31,3 +31,11 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# Benchmark (measurement only, not part of installcheck): DML cost with and
+# without auditing. Requires the extension to be installed (make install).
+# Usage: make USE_PGXS=1 bench   (honours PGHOST/PGPORT/PGUSER)
+# Declared after the PGXS include so that "all" stays the default target.
+.PHONY: bench
+bench:
+	psql -X -q -v ON_ERROR_STOP=1 -f test/bench.sql

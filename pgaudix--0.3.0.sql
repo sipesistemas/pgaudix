@@ -1,8 +1,8 @@
 -- pgaudix: automatic table auditing with column mirroring and DDL sync
--- Version 0.2.0
+-- Version 0.3.0
 --
 -- This is the full install script for a fresh `CREATE EXTENSION pgaudix`.
--- It must always reflect the COMPLETE schema of version 0.2.0.
+-- It must always reflect the COMPLETE schema of version 0.3.0.
 
 \echo Use "CREATE EXTENSION pgaudix" to load this file. \quit
 
