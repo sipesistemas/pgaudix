@@ -21,7 +21,7 @@ WHERE table_schema = 'public' AND table_name = 'test_orders_audit'
 ORDER BY ordinal_position;
 
 -- Verify registration
-SELECT source_schema, source_table, audit_table, enabled
+SELECT source_schema, source_table, audit_table
 FROM pgaudix.status();
 
 -- ============================================================
@@ -572,8 +572,8 @@ WHERE proname = 'enable' AND pronamespace = 'pgaudix'::regnamespace;
 CREATE TABLE public.test_a4 (id int, v text);
 SELECT pgaudix.enable('public.test_a4');
 
--- Manually drop audit_app_name to force v_offset = NULL on next ddl_sync
-ALTER TABLE public.test_a4_audit DROP COLUMN audit_app_name;
+-- Manually drop audit_app_user (the offset column) to force v_offset = NULL on next ddl_sync
+ALTER TABLE public.test_a4_audit DROP COLUMN audit_app_user;
 
 DO $$
 BEGIN
@@ -667,8 +667,10 @@ SELECT count(*) AS orphan_rows
 FROM pgaudix.monitored_tables
 WHERE source_table = 'test_a3';
 
--- Audit table is also cleaned up (or at least no orphan registration)
-DROP TABLE IF EXISTS public.test_a3_audit;
+-- The audit table is dropped together with its source
+SELECT count(*) AS audit_tables_left
+FROM pg_catalog.pg_class
+WHERE relname = 'test_a3_audit';
 
 -- ============================================================
 -- Test 34: A2 — ALTER SCHEMA RENAME keeps audit in sync
@@ -720,6 +722,869 @@ WHERE source_table = 'test_m4';
 -- Cleanup (disable accepts missing audit table)
 SELECT pgaudix.disable('public.test_m4');
 DROP TABLE public.test_m4;
+
+-- ============================================================
+-- Test 36: registry survives pg_dump/restore
+-- ============================================================
+-- monitored_tables (and its sequence) must be marked for dump, otherwise
+-- pg_dump skips their contents because they belong to the extension
+SELECT c.relname
+FROM pg_catalog.pg_extension e
+CROSS JOIN LATERAL unnest(e.extconfig) AS cfg(relid)
+JOIN pg_catalog.pg_class c ON c.oid = cfg.relid
+WHERE e.extname = 'pgaudix'
+ORDER BY 1;
+
+CREATE TABLE public.test_restore (id int, v text);
+SELECT pgaudix.enable('public.test_restore');
+
+-- Simulate a logical restore: the registry row comes back but every relation
+-- got a new OID, so the stored source_oid / audit_oid point at nothing
+UPDATE pgaudix.monitored_tables
+SET source_oid = 4294967295, audit_oid = 4294967294
+WHERE source_table = 'test_restore';
+
+-- DDL sync must re-resolve the table by name and keep the audit table in sync
+ALTER TABLE public.test_restore ADD COLUMN w int;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_restore_audit'
+  AND column_name = 'w';
+
+INSERT INTO public.test_restore VALUES (1, 'a', 2);
+
+SELECT audit_operation, id, v, w
+FROM public.test_restore_audit
+ORDER BY audit_id;
+
+-- The registry now holds the real OIDs again
+SELECT source_oid = 'public.test_restore'::regclass       AS source_oid_healed,
+       audit_oid  = 'public.test_restore_audit'::regclass AS audit_oid_healed
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_restore';
+
+-- status() heals too
+UPDATE pgaudix.monitored_tables
+SET source_oid = 4294967295, audit_oid = NULL
+WHERE source_table = 'test_restore';
+
+SELECT audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_restore';
+
+-- disable() heals too
+UPDATE pgaudix.monitored_tables
+SET source_oid = 4294967295, audit_oid = NULL
+WHERE source_table = 'test_restore';
+
+SELECT pgaudix.disable('public.test_restore', drop_data := true);
+
+SELECT count(*) AS registry_rows_left
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_restore';
+
+DROP TABLE public.test_restore;
+
+-- drop_cleanup must also match by name when the stored OID is stale
+CREATE TABLE public.test_restore2 (id int);
+SELECT pgaudix.enable('public.test_restore2');
+
+UPDATE pgaudix.monitored_tables
+SET source_oid = 4294967295
+WHERE source_table = 'test_restore2';
+
+DROP TABLE public.test_restore2;
+
+SELECT count(*) AS orphan_rows
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_restore2';
+
+DROP TABLE public.test_restore2_audit;
+
+-- ============================================================
+-- Test 37: ALTER COLUMN TYPE that needs USING keeps the source writable
+-- ============================================================
+CREATE TABLE public.test_type (id int, flag int, n int, v text);
+SELECT pgaudix.enable('public.test_type');
+INSERT INTO public.test_type VALUES (1, 1, 1, 'a very long string');
+
+-- int -> boolean: history converts with an explicit cast, audit follows the type
+ALTER TABLE public.test_type ALTER COLUMN flag TYPE boolean USING flag <> 0;
+
+SELECT data_type
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_type_audit'
+  AND column_name = 'flag';
+
+INSERT INTO public.test_type VALUES (2, true, 2, 'x');
+
+-- int -> uuid: history cannot convert; the audit column degrades to text so
+-- history is kept and new (uuid) values can still be written
+ALTER TABLE public.test_type ALTER COLUMN n TYPE uuid USING NULL;
+
+SELECT data_type
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_type_audit'
+  AND column_name = 'n';
+
+INSERT INTO public.test_type VALUES (3, false, '6d1d3e3c-0b3a-4d3a-9c1e-1f4c7a2b9e10', 'y');
+
+-- text -> varchar(3): history is too long; a text audit column is never
+-- narrowed, and later DDL must not keep warning about it
+ALTER TABLE public.test_type ALTER COLUMN v TYPE varchar(3) USING left(v, 3);
+ALTER TABLE public.test_type ADD COLUMN extra int;
+
+SELECT data_type
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_type_audit'
+  AND column_name = 'v';
+
+INSERT INTO public.test_type VALUES (4, true, NULL, 'z', 9);
+
+SELECT audit_operation, id, flag, n, v, extra
+FROM public.test_type_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_type', drop_data := true);
+DROP TABLE public.test_type;
+
+-- ============================================================
+-- Test 38: source columns named like gap fillers are left alone
+-- ============================================================
+-- drop_me leaves a hole at attnum 2, exactly where a gap filler goes;
+-- the source also has a real column with the filler's name, and one
+-- that only matches the old LIKE pattern through its unescaped '_'
+CREATE TABLE public.test_gapname (
+    id              int,
+    drop_me         int,
+    _pgaudix_gap_2  int,
+    xpgaudix_gap_1  text
+);
+ALTER TABLE public.test_gapname DROP COLUMN drop_me;
+
+SELECT pgaudix.enable('public.test_gapname');
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_gapname_audit'
+  AND column_name NOT LIKE 'audit\_%'
+ORDER BY ordinal_position;
+
+INSERT INTO public.test_gapname VALUES (1, 2, 'x');
+
+-- attnum alignment must still hold after the fillers are dropped
+ALTER TABLE public.test_gapname ADD COLUMN later int;
+INSERT INTO public.test_gapname VALUES (2, 3, 'y', 4);
+
+SELECT audit_operation, id, _pgaudix_gap_2, xpgaudix_gap_1, later
+FROM public.test_gapname_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_gapname', drop_data := true);
+DROP TABLE public.test_gapname;
+
+-- ============================================================
+-- Test 39: pg_temp cannot shadow the types used by the API functions
+-- ============================================================
+-- Fresh session: PL/pgSQL resolves DECLARE types on the first call per
+-- backend, so the shadowing temp tables must exist before that call
+\c
+CREATE TEMP TABLE text (dummy int);
+CREATE TEMP TABLE name (dummy int);
+
+CREATE TABLE public.test_shadow (id int, v pg_catalog.text);
+SELECT pgaudix.enable('public.test_shadow');
+
+INSERT INTO public.test_shadow VALUES (1, 'a');
+ALTER TABLE public.test_shadow ADD COLUMN w int;
+INSERT INTO public.test_shadow VALUES (2, 'b', 3);
+
+SELECT audit_operation, id, v, w
+FROM public.test_shadow_audit
+ORDER BY audit_id;
+
+SELECT dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_shadow';
+
+SELECT pgaudix.disable('public.test_shadow', drop_data := true);
+DROP TABLE public.test_shadow;
+DROP TABLE pg_temp.text, pg_temp.name;
+
+-- ============================================================
+-- Test 40: DROP and ADD of the same column name in one statement
+-- ============================================================
+CREATE TABLE public.test_dropadd (id int, c text);
+SELECT pgaudix.enable('public.test_dropadd');
+INSERT INTO public.test_dropadd VALUES (1, 'old');
+
+-- PostgreSQL runs the DROP before the ADD, so the audit table must drop its
+-- old "c" before adding the new one
+ALTER TABLE public.test_dropadd DROP COLUMN c, ADD COLUMN c int;
+
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_dropadd_audit'
+  AND column_name = 'c';
+
+INSERT INTO public.test_dropadd VALUES (2, 42);
+
+-- attnum alignment still holds afterwards
+ALTER TABLE public.test_dropadd ADD COLUMN d int;
+INSERT INTO public.test_dropadd VALUES (3, 43, 44);
+
+SELECT audit_operation, id, c, d
+FROM public.test_dropadd_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_dropadd', drop_data := true);
+DROP TABLE public.test_dropadd;
+
+-- ============================================================
+-- Test 41: ADD COLUMN order must not depend on the pg_attribute scan plan
+-- ============================================================
+CREATE TABLE public.test_order (id int);
+SELECT pgaudix.enable('public.test_order');
+
+-- Force a heap scan of pg_attribute: the SET DEFAULT on "e" rewrites its
+-- catalog row, so physical order becomes f, e
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
+ALTER TABLE public.test_order ADD COLUMN e int, ADD COLUMN f int, ALTER COLUMN e SET DEFAULT 1;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_bitmapscan;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_order_audit'
+  AND column_name IN ('e', 'f')
+ORDER BY ordinal_position;
+
+INSERT INTO public.test_order VALUES (1, 2, 3);
+
+SELECT audit_operation, id, e, f
+FROM public.test_order_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_order', drop_data := true);
+DROP TABLE public.test_order;
+
+-- ============================================================
+-- Test 42: DDL propagated through inheritance / partitioning is synced
+-- ============================================================
+-- pg_event_trigger_ddl_commands() only reports the table named in the
+-- ALTER, so descendants must be expanded explicitly
+CREATE TABLE public.test_parent (id int);
+CREATE TABLE public.test_child (extra text) INHERITS (public.test_parent);
+SELECT pgaudix.enable('public.test_child');
+
+ALTER TABLE public.test_parent ADD COLUMN newcol int;
+ALTER TABLE public.test_parent RENAME COLUMN id TO id2;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_child_audit'
+  AND column_name NOT LIKE 'audit\_%'
+ORDER BY ordinal_position;
+
+INSERT INTO public.test_child VALUES (1, 'x', 2);
+
+SELECT audit_operation, id2, extra, newcol
+FROM public.test_child_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_child', drop_data := true);
+DROP TABLE public.test_child;
+DROP TABLE public.test_parent;
+
+-- A partition audited directly must follow ALTERs on its root
+CREATE TABLE public.test_proot (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_p1 PARTITION OF public.test_proot FOR VALUES IN (1);
+SELECT pgaudix.enable('public.test_p1');
+
+ALTER TABLE public.test_proot ADD COLUMN v text;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_p1_audit'
+  AND column_name = 'v';
+
+INSERT INTO public.test_proot VALUES (1, 1, 'a');
+
+SELECT audit_operation, id, k, v
+FROM public.test_p1_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_p1', drop_data := true);
+DROP TABLE public.test_proot;
+
+-- ============================================================
+-- Test 43: partition-leaf TRUNCATE triggers follow RENAME, ATTACH and DETACH
+-- ============================================================
+CREATE TABLE public.test_pr (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_pr_1 PARTITION OF public.test_pr FOR VALUES IN (1);
+SELECT pgaudix.enable('public.test_pr');
+
+-- Rename the root: the leaf trigger must point at the renamed audit table
+ALTER TABLE public.test_pr RENAME TO test_pr2;
+TRUNCATE public.test_pr_1;
+
+-- A partition attached after enable() must be audited too
+CREATE TABLE public.test_pr_2 (id int, k int);
+ALTER TABLE public.test_pr2 ATTACH PARTITION public.test_pr_2 FOR VALUES IN (2);
+TRUNCATE public.test_pr_2;
+
+SELECT count(*) AS truncate_rows
+FROM public.test_pr2_audit
+WHERE audit_operation = 'T';
+
+-- A detached partition must not keep writing into the root's audit table
+ALTER TABLE public.test_pr2 DETACH PARTITION public.test_pr_1;
+
+SELECT count(*) AS leaf_triggers_after_detach
+FROM pg_catalog.pg_trigger
+WHERE tgrelid = 'public.test_pr_1'::regclass AND tgname = 'pgaudix_truncate_trigger';
+
+TRUNCATE public.test_pr_1;
+
+SELECT count(*) AS truncate_rows_after_detach
+FROM public.test_pr2_audit
+WHERE audit_operation = 'T';
+
+-- disable() removes the remaining leaf trigger
+SELECT pgaudix.disable('public.test_pr2', drop_data := true);
+
+SELECT count(*) AS leaf_triggers_after_disable
+FROM pg_catalog.pg_trigger
+WHERE tgrelid = 'public.test_pr_2'::regclass AND tgname = 'pgaudix_truncate_trigger';
+
+DROP TABLE public.test_pr2;
+DROP TABLE public.test_pr_1;
+
+-- ============================================================
+-- Test 44: DDL sync and drop cleanup also run under replica role
+-- ============================================================
+-- The DML/TRUNCATE triggers are ENABLE ALWAYS (bug #4), so the event
+-- triggers must be too, otherwise DDL desyncs the audit table
+SELECT evtname, evtenabled
+FROM pg_catalog.pg_event_trigger
+WHERE evtname LIKE 'pgaudix%'
+ORDER BY evtname;
+
+CREATE TABLE public.test_replica (id int);
+CREATE TABLE public.test_replica_drop (id int);
+SELECT pgaudix.enable('public.test_replica');
+SELECT pgaudix.enable('public.test_replica_drop');
+
+SET session_replication_role = replica;
+ALTER TABLE public.test_replica ADD COLUMN x int;
+INSERT INTO public.test_replica VALUES (1, 2);
+DROP TABLE public.test_replica_drop;
+RESET session_replication_role;
+
+SELECT audit_operation, id, x
+FROM public.test_replica_audit
+ORDER BY audit_id;
+
+SELECT count(*) AS orphan_rows
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_replica_drop';
+
+SELECT pgaudix.disable('public.test_replica', drop_data := true);
+DROP TABLE public.test_replica;
+DROP TABLE public.test_replica_drop_audit;
+
+-- ============================================================
+-- Test 45: the DDL sync recursion guard cannot be forged by a regular role
+-- ============================================================
+CREATE ROLE pgaudix_test_guard;
+CREATE TABLE public.test_guard (id int);
+SELECT pgaudix.enable('public.test_guard');
+
+-- A custom GUC can be set by anyone; it must not disable the sync
+SET ROLE pgaudix_test_guard;
+SET pgaudix.in_ddl_sync = 'true';
+RESET ROLE;
+
+ALTER TABLE public.test_guard ADD COLUMN x int;
+INSERT INTO public.test_guard VALUES (1, 2);
+
+SELECT audit_operation, id, x
+FROM public.test_guard_audit
+ORDER BY audit_id;
+
+RESET pgaudix.in_ddl_sync;
+SELECT pgaudix.disable('public.test_guard', drop_data := true);
+DROP TABLE public.test_guard;
+DROP ROLE pgaudix_test_guard;
+
+-- ============================================================
+-- Test 46: functions are closed to PUBLIC; enable/disable check ownership
+-- ============================================================
+CREATE ROLE pgaudix_test_owner;
+CREATE ROLE pgaudix_test_other;
+GRANT USAGE ON SCHEMA pgaudix TO pgaudix_test_owner, pgaudix_test_other;
+GRANT USAGE, CREATE ON SCHEMA public TO pgaudix_test_owner, pgaudix_test_other;
+
+CREATE TABLE public.test_priv_other (id int);
+CREATE TABLE public.test_priv_other2 (id int);
+ALTER TABLE public.test_priv_other OWNER TO pgaudix_test_other;
+ALTER TABLE public.test_priv_other2 OWNER TO pgaudix_test_other;
+SELECT pgaudix.enable('public.test_priv_other');
+
+SET ROLE pgaudix_test_owner;
+CREATE TABLE public.test_priv_own (id int, v text);
+
+-- Schema USAGE alone grants nothing: the API and the trigger functions
+-- (which run as the extension owner) must not be executable by PUBLIC
+SELECT pgaudix.enable('public.test_priv_own');
+SELECT count(*) FROM pgaudix.status();
+CREATE TRIGGER forge AFTER INSERT ON public.test_priv_own
+    FOR EACH ROW EXECUTE FUNCTION pgaudix.audit_trigger('"public"."test_priv_other_audit"');
+CREATE TRIGGER forge_t AFTER TRUNCATE ON public.test_priv_own
+    FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger('public', 'test_priv_other_audit');
+RESET ROLE;
+
+-- With EXECUTE granted, a role can only manage tables it owns
+GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass), pgaudix.disable(regclass, boolean),
+                          pgaudix.status() TO pgaudix_test_owner;
+SET ROLE pgaudix_test_owner;
+SELECT pgaudix.enable('public.test_priv_own');
+INSERT INTO public.test_priv_own VALUES (1, 'a');
+SELECT count(*) AS visible_in_status FROM pgaudix.status();
+SELECT pgaudix.enable('public.test_priv_other2');
+SELECT pgaudix.disable('public.test_priv_other', drop_data := true);
+RESET ROLE;
+
+-- The other table's audit data survived, and the owner's DML was audited
+SELECT count(*) AS other_audit_table_exists
+FROM pg_catalog.pg_class WHERE relname = 'test_priv_other_audit';
+
+SELECT audit_operation, id, v
+FROM public.test_priv_own_audit
+ORDER BY audit_id;
+
+-- Cleanup
+SELECT pgaudix.disable('public.test_priv_own', drop_data := true);
+SELECT pgaudix.disable('public.test_priv_other', drop_data := true);
+DROP TABLE public.test_priv_own;
+DROP TABLE public.test_priv_other;
+DROP TABLE public.test_priv_other2;
+DROP OWNED BY pgaudix_test_owner, pgaudix_test_other;
+DROP ROLE pgaudix_test_owner;
+DROP ROLE pgaudix_test_other;
+
+-- ============================================================
+-- Test 47: one T row per TRUNCATE statement on a partitioned table
+-- ============================================================
+CREATE TABLE public.test_tr (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_tr_1 PARTITION OF public.test_tr FOR VALUES IN (1);
+CREATE TABLE public.test_tr_2 PARTITION OF public.test_tr FOR VALUES IN (2);
+SELECT pgaudix.enable('public.test_tr');
+
+-- TRUNCATE of the root fires the statement triggers of the root and of every
+-- partition; only one audit row must be written
+TRUNCATE public.test_tr;
+SELECT count(*) AS rows_after_root_truncate
+FROM public.test_tr_audit WHERE audit_operation = 'T';
+
+-- A partition truncated directly is still audited
+TRUNCATE public.test_tr_1;
+SELECT count(*) AS rows_after_leaf_truncate
+FROM public.test_tr_audit WHERE audit_operation = 'T';
+
+-- Separate statements in one transaction are separate operations
+BEGIN;
+    TRUNCATE public.test_tr_2;
+    TRUNCATE public.test_tr;
+COMMIT;
+SELECT count(*) AS rows_after_two_statements
+FROM public.test_tr_audit WHERE audit_operation = 'T';
+
+SELECT pgaudix.disable('public.test_tr', drop_data := true);
+DROP TABLE public.test_tr;
+
+-- ============================================================
+-- Test 48: domain columns are mirrored with the domain's base type
+-- ============================================================
+-- A domain carries its NOT NULL / CHECK constraints with the type name, and
+-- the T row leaves every mirrored column NULL, so the audit table must use
+-- the underlying base type instead
+CREATE DOMAIN public.test_nn_int AS int NOT NULL;
+CREATE DOMAIN public.test_pos AS numeric(8,2) CHECK (VALUE > 0);
+CREATE DOMAIN public.test_nested AS public.test_pos;
+
+CREATE TABLE public.test_dom (
+    id int,
+    a  public.test_nn_int,
+    b  public.test_pos,
+    c  public.test_nested
+);
+SELECT pgaudix.enable('public.test_dom');
+
+SELECT column_name, data_type, numeric_precision, numeric_scale, domain_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_dom_audit'
+  AND column_name IN ('a', 'b', 'c')
+ORDER BY ordinal_position;
+
+INSERT INTO public.test_dom VALUES (1, 2, 3.5, 4.25);
+TRUNCATE public.test_dom;
+
+-- DDL sync must apply the same rule for added and retyped columns
+ALTER TABLE public.test_dom ADD COLUMN d public.test_nn_int;
+ALTER TABLE public.test_dom ALTER COLUMN id TYPE public.test_nn_int USING id;
+INSERT INTO public.test_dom VALUES (2, 5, 6.5, 7.25, 8);
+TRUNCATE public.test_dom;
+
+-- and must not keep trying to "convert" the audit columns afterwards
+ALTER TABLE public.test_dom ADD COLUMN e int;
+
+SELECT column_name, data_type, domain_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_dom_audit'
+  AND column_name IN ('id', 'd')
+ORDER BY ordinal_position;
+
+SELECT audit_operation, id, a, b, c, d
+FROM public.test_dom_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_dom', drop_data := true);
+DROP TABLE public.test_dom;
+DROP DOMAIN public.test_nested;
+DROP DOMAIN public.test_pos;
+DROP DOMAIN public.test_nn_int;
+
+-- ============================================================
+-- Test 49: a broken registry row must not affect DDL on other tables
+-- ============================================================
+CREATE TABLE public.test_broken (id int);
+CREATE TABLE public.test_conflict (id int);
+CREATE TABLE public.test_unrelated (id int);
+SELECT pgaudix.enable('public.test_broken');
+SELECT pgaudix.enable('public.test_conflict');
+SELECT pgaudix.enable('public.test_unrelated');
+
+-- Audit table dropped behind pgaudix's back
+DROP TABLE public.test_broken_audit;
+
+-- Registry drift: the source was renamed while the sync was bypassed (only a
+-- superuser can do this), and the audit name it now expects is taken
+CREATE TABLE public.test_conflict2_audit (x int);
+INSERT INTO pgaudix.ddl_guard (pid) VALUES (pg_backend_pid());
+ALTER TABLE public.test_conflict RENAME TO test_conflict2;
+DELETE FROM pgaudix.ddl_guard WHERE pid = pg_backend_pid();
+
+-- DDL on an unrelated table: no NOTICE, no error, synced normally
+ALTER TABLE public.test_unrelated ADD COLUMN x int;
+INSERT INTO public.test_unrelated VALUES (1, 2);
+
+SELECT audit_operation, id, x
+FROM public.test_unrelated_audit
+ORDER BY audit_id;
+
+-- The broken tables report their own problem only when they are altered
+ALTER TABLE public.test_broken ADD COLUMN y int;
+ALTER TABLE public.test_conflict2 ADD COLUMN y int;
+
+-- Cleanup
+SELECT pgaudix.disable('public.test_unrelated', drop_data := true);
+SELECT pgaudix.disable('public.test_broken');
+SELECT pgaudix.disable('public.test_conflict2');
+DROP TABLE public.test_unrelated;
+DROP TABLE public.test_broken;
+DROP TABLE public.test_conflict2;
+DROP TABLE public.test_conflict_audit;
+DROP TABLE public.test_conflict2_audit;
+
+-- ============================================================
+-- Test 50: the extension's own tables cannot be audited
+-- ============================================================
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('pgaudix.monitored_tables');
+    RAISE NOTICE 'ERROR: enable on pgaudix.monitored_tables should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: enable on extension table rejected: %', SQLERRM;
+END;
+$$;
+
+SELECT count(*) AS registry_audit_tables
+FROM pg_catalog.pg_class
+WHERE relname = 'monitored_tables_audit';
+
+-- ============================================================
+-- Test 51: DDL after the first audited row in the same session
+-- ============================================================
+-- The C trigger caches its INSERT plan per source relation; every kind of
+-- change that alters the column list must invalidate it within the session
+CREATE TABLE public.test_cache (id int, a text);
+SELECT pgaudix.enable('public.test_cache');
+INSERT INTO public.test_cache VALUES (1, 'a');
+
+ALTER TABLE public.test_cache ADD COLUMN b int;
+INSERT INTO public.test_cache VALUES (2, 'b', 20);
+
+ALTER TABLE public.test_cache RENAME COLUMN b TO c;
+INSERT INTO public.test_cache VALUES (3, 'c', 30);
+
+ALTER TABLE public.test_cache ALTER COLUMN c TYPE bigint;
+INSERT INTO public.test_cache VALUES (4, 'd', 40);
+
+ALTER TABLE public.test_cache DROP COLUMN a;
+INSERT INTO public.test_cache VALUES (5, 50);
+
+ALTER TABLE public.test_cache RENAME TO test_cache2;
+INSERT INTO public.test_cache2 VALUES (6, 60);
+
+SELECT audit_operation, id, c
+FROM public.test_cache2_audit
+ORDER BY audit_id;
+
+-- Disable and re-enable in the same session
+SELECT pgaudix.disable('public.test_cache2', drop_data := true);
+INSERT INTO public.test_cache2 VALUES (7, 70);
+SELECT pgaudix.enable('public.test_cache2');
+INSERT INTO public.test_cache2 VALUES (8, 80);
+
+SELECT audit_operation, id, c
+FROM public.test_cache2_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_cache2', drop_data := true);
+DROP TABLE public.test_cache2;
+
+-- Partitions with different physical layouts share one audit table
+CREATE TABLE public.test_cpart (id int, k int, v text) PARTITION BY LIST (k);
+CREATE TABLE public.test_cpart_1 PARTITION OF public.test_cpart FOR VALUES IN (1);
+CREATE TABLE public.test_cpart_2 (id int, junk int, k int, v text);
+ALTER TABLE public.test_cpart_2 DROP COLUMN junk;
+ALTER TABLE public.test_cpart ATTACH PARTITION public.test_cpart_2 FOR VALUES IN (2);
+SELECT pgaudix.enable('public.test_cpart');
+
+INSERT INTO public.test_cpart VALUES (1, 1, 'p1'), (2, 2, 'p2'), (3, 1, 'p1 again');
+UPDATE public.test_cpart SET v = v || '!' WHERE id = 2;
+
+SELECT audit_operation, id, k, v
+FROM public.test_cpart_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_cpart', drop_data := true);
+DROP TABLE public.test_cpart;
+
+-- ============================================================
+-- Test 52: audit_app_user records the application user set via GUC
+-- ============================================================
+-- A SaaS connects with one PostgreSQL role, so audit_user cannot identify
+-- the end user. The application sets pgaudix.app_user per transaction and
+-- the audit row records it; NULL when nothing was set.
+CREATE TABLE public.test_appuser (id int, v text);
+SELECT pgaudix.enable('public.test_appuser');
+
+INSERT INTO public.test_appuser VALUES (1, 'anonymous');
+
+BEGIN;
+    SET LOCAL pgaudix.app_user = 'user-4711';
+    INSERT INTO public.test_appuser VALUES (2, 'by 4711');
+    UPDATE public.test_appuser SET v = 'by 4711 again' WHERE id = 2;
+COMMIT;
+
+-- SET LOCAL ends with the transaction
+INSERT INTO public.test_appuser VALUES (3, 'anonymous again');
+
+SELECT audit_operation, id, v, audit_app_user, audit_user = session_user AS pg_user_ok
+FROM public.test_appuser_audit
+ORDER BY audit_id;
+
+-- Metadata columns come first, then mirrored columns; DDL sync still aligns
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_appuser_audit'
+ORDER BY ordinal_position;
+
+ALTER TABLE public.test_appuser ADD COLUMN w int;
+INSERT INTO public.test_appuser VALUES (4, 'x', 40);
+
+SELECT audit_operation, id, v, w
+FROM public.test_appuser_audit
+WHERE id = 4;
+
+SELECT pgaudix.disable('public.test_appuser', drop_data := true);
+DROP TABLE public.test_appuser;
+
+-- The new metadata name is reserved
+CREATE TABLE public.test_appuser_clash (id int, audit_app_user text);
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_appuser_clash');
+    RAISE NOTICE 'ERROR: enable should have rejected a source column named audit_app_user';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: reserved name rejected';
+END;
+$$;
+DROP TABLE public.test_appuser_clash;
+
+-- ============================================================
+-- Test 53: dropping the source drops its audit table
+-- ============================================================
+CREATE TABLE public.test_dropsrc (id int);
+SELECT pgaudix.enable('public.test_dropsrc');
+INSERT INTO public.test_dropsrc VALUES (1);
+DROP TABLE public.test_dropsrc;
+
+SELECT count(*) AS audit_tables_left
+FROM pg_catalog.pg_class
+WHERE relname = 'test_dropsrc_audit';
+
+-- A table recreated with the same name can be audited again
+CREATE TABLE public.test_dropsrc (id int, v text);
+SELECT pgaudix.enable('public.test_dropsrc');
+INSERT INTO public.test_dropsrc VALUES (2, 'again');
+
+SELECT audit_operation, id, v
+FROM public.test_dropsrc_audit
+ORDER BY audit_id;
+
+SELECT pgaudix.disable('public.test_dropsrc', drop_data := true);
+DROP TABLE public.test_dropsrc;
+
+-- Source and audit dropped by the same statement
+CREATE SCHEMA test_dropschema;
+CREATE TABLE test_dropschema.t (id int);
+SELECT pgaudix.enable('test_dropschema.t');
+DROP SCHEMA test_dropschema CASCADE;
+
+SELECT count(*) AS registry_rows_left
+FROM pgaudix.monitored_tables
+WHERE source_schema = 'test_dropschema';
+
+-- ============================================================
+-- Test 54: no dead "enabled" flag in the registry
+-- ============================================================
+-- Auditing is either on (registered) or off (disable()); a flag nobody sets
+-- would only mislead an operator into editing the registry by hand
+SELECT count(*) AS enabled_columns
+FROM information_schema.columns
+WHERE (table_schema = 'pgaudix' AND table_name = 'monitored_tables' AND column_name = 'enabled')
+   OR (table_schema = 'pgaudix' AND table_name = 'status' AND column_name = 'enabled');
+
+SELECT count(*) AS enabled_in_status
+FROM pg_catalog.pg_proc p
+CROSS JOIN LATERAL unnest(p.proargnames) AS a(name)
+WHERE p.proname = 'status' AND p.pronamespace = 'pgaudix'::regnamespace
+  AND a.name = 'enabled';
+
+-- ============================================================
+-- Test 55: scenarios inherited from the retired bug-confirmation script
+-- ============================================================
+-- Two ALTERs in one transaction are both synced (recursion guard released)
+CREATE TABLE public.test_twoalter (id int);
+SELECT pgaudix.enable('public.test_twoalter');
+BEGIN;
+    ALTER TABLE public.test_twoalter ADD COLUMN a int;
+    ALTER TABLE public.test_twoalter ADD COLUMN b int;
+COMMIT;
+INSERT INTO public.test_twoalter VALUES (1, 2, 3);
+SELECT audit_operation, id, a, b FROM public.test_twoalter_audit;
+SELECT pgaudix.disable('public.test_twoalter', drop_data := true);
+DROP TABLE public.test_twoalter;
+
+-- ALTER TABLE ... SET SCHEMA moves the audit table along
+CREATE SCHEMA test_ss_old;
+CREATE SCHEMA test_ss_new;
+CREATE TABLE test_ss_old.t (id int, v text);
+SELECT pgaudix.enable('test_ss_old.t');
+ALTER TABLE test_ss_old.t SET SCHEMA test_ss_new;
+INSERT INTO test_ss_new.t VALUES (1, 'moved');
+SELECT audit_operation, id, v FROM test_ss_new.t_audit;
+SELECT source_schema, audit_schema FROM pgaudix.status() WHERE source_table = 't';
+SELECT pgaudix.disable('test_ss_new.t', drop_data := true);
+DROP TABLE test_ss_new.t;
+DROP SCHEMA test_ss_old;
+DROP SCHEMA test_ss_new;
+
+-- The audit-name length guard counts bytes: 30 multibyte chars = 60 bytes,
+-- plus "_audit" exceeds NAMEDATALEN even though it is only 36 characters
+DO $$
+DECLARE
+    src text := repeat(chr(225), 30);
+BEGIN
+    EXECUTE format('CREATE TABLE public.%I (id int)', src);
+    BEGIN
+        PERFORM pgaudix.enable(format('public.%I', src)::regclass);
+        RAISE NOTICE 'ERROR: enable should have rejected a 60-byte name';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'OK: multibyte name rejected';
+    END;
+    EXECUTE format('DROP TABLE public.%I', src);
+END;
+$$;
+
+-- A source whose attnum span would overflow 1600 audit columns is rejected
+-- with a pgaudix error, not the generic "tables can have at most 1600 columns"
+DO $$
+DECLARE
+    cols  text;
+    drops text;
+BEGIN
+    SELECT string_agg(format('c%s int', g), ', ') INTO cols FROM generate_series(1, 1595) g;
+    EXECUTE format('CREATE TABLE public.test_wide (id int, %s)', cols);
+    SELECT string_agg(format('DROP COLUMN c%s', g), ', ') INTO drops FROM generate_series(1, 1594) g;
+    EXECUTE format('ALTER TABLE public.test_wide %s', drops);
+    BEGIN
+        PERFORM pgaudix.enable('public.test_wide');
+        RAISE NOTICE 'ERROR: enable should have rejected the attnum span';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'OK: % ', SQLERRM;
+    END;
+    DROP TABLE public.test_wide;
+END;
+$$;
+
+-- An UNLOGGED source gets an UNLOGGED audit table
+CREATE UNLOGGED TABLE public.test_unlogged (id int);
+SELECT pgaudix.enable('public.test_unlogged');
+SELECT relname, relpersistence
+FROM pg_catalog.pg_class
+WHERE relname IN ('test_unlogged', 'test_unlogged_audit')
+ORDER BY relname;
+SELECT pgaudix.disable('public.test_unlogged', drop_data := true);
+DROP TABLE public.test_unlogged;
+
+-- ============================================================
+-- Test 56: reserved metadata names in ADD / RENAME COLUMN give a clear error
+-- ============================================================
+CREATE TABLE public.test_reserved (id int, x int);
+SELECT pgaudix.enable('public.test_reserved');
+
+DO $$
+BEGIN
+    ALTER TABLE public.test_reserved RENAME COLUMN x TO audit_user;
+    RAISE NOTICE 'ERROR: rename to a reserved name should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+
+DO $$
+BEGIN
+    ALTER TABLE public.test_reserved ADD COLUMN audit_id int;
+    RAISE NOTICE 'ERROR: adding a reserved name should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+
+-- The table is untouched and still audited
+INSERT INTO public.test_reserved VALUES (1, 2);
+SELECT audit_operation, id, x FROM public.test_reserved_audit;
+
+SELECT pgaudix.disable('public.test_reserved', drop_data := true);
+DROP TABLE public.test_reserved;
 
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (
