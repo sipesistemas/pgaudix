@@ -27,10 +27,14 @@ PG_FUNCTION_INFO_V1(pgaudix_trigger);
  * tuple descriptor and the trigger argument (the audit table name), both of
  * which only change through DDL on the source relation, and any such DDL
  * invalidates the source's relcache entry in every backend. A relcache
- * callback therefore marks the entry stale; it is rebuilt on next use. The
- * plan is freed lazily (not inside the callback, which may run during abort
- * processing). Changes to the audit table itself are tracked by PostgreSQL's
- * own plan cache, which replans the saved statement.
+ * callback therefore marks the entry stale; it is rebuilt on next use. Stale
+ * plans are freed on the next trigger call, not inside the callback (which
+ * may run during abort processing) and never while the plan is executing
+ * (in_use, for a nested audit trigger fired from within the audit INSERT).
+ * Entries of relations that were dropped are swept the same way, so a
+ * long-lived connection that churns through partitions does not accumulate
+ * plans. Changes to the audit table itself are tracked by PostgreSQL's own
+ * plan cache, which replans the saved statement.
  */
 typedef struct AuditPlanEntry
 {
@@ -39,14 +43,19 @@ typedef struct AuditPlanEntry
 	SPIPlanPtr	plan;			/* saved plan (SPI_keepplan), or NULL */
 	int			nparams;		/* 1 (operation) + audited columns */
 	int			natts;			/* natts of the tupdesc the plan was built for */
+	int			in_use;			/* nesting depth of SPI_execute_plan on plan */
 } AuditPlanEntry;
 
 static HTAB *audit_plan_cache = NULL;
 
+/* Number of entries marked stale by the callback and not yet swept */
+static int	stale_entries = 0;
+
 /*
- * Columns that are not mirrored in the audit table: dropped columns, and
- * virtual generated columns (PostgreSQL 18+), which carry no stored value
- * and are left out by enable()/ddl_sync().
+ * Columns the trigger does not write: dropped columns, and virtual generated
+ * columns (PostgreSQL 18+), which carry no stored value. enable()/ddl_sync()
+ * still mirror a virtual column in the audit table (it stays NULL) so the
+ * attnum alignment survives pg_dump/restore.
  */
 static inline bool
 skip_attribute(Form_pg_attribute attr)
@@ -76,8 +85,11 @@ audit_plan_cache_callback(Datum arg, Oid relid)
 	{
 		entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
 											   HASH_FIND, NULL);
-		if (entry != NULL)
+		if (entry != NULL && entry->valid)
+		{
 			entry->valid = false;
+			stale_entries++;
+		}
 	}
 	else
 	{
@@ -85,8 +97,44 @@ audit_plan_cache_callback(Datum arg, Oid relid)
 
 		hash_seq_init(&status, audit_plan_cache);
 		while ((entry = (AuditPlanEntry *) hash_seq_search(&status)) != NULL)
-			entry->valid = false;
+		{
+			if (entry->valid)
+			{
+				entry->valid = false;
+				stale_entries++;
+			}
+		}
 	}
+}
+
+/*
+ * Free and remove every stale entry that is not executing right now, except
+ * the one for keep_relid (its caller rebuilds it in place). Safe to call only
+ * from the trigger, never from the invalidation callback.
+ */
+static void
+sweep_stale_plans(Oid keep_relid)
+{
+	HASH_SEQ_STATUS status;
+	AuditPlanEntry *entry;
+	int			remaining = 0;
+
+	hash_seq_init(&status, audit_plan_cache);
+	while ((entry = (AuditPlanEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->valid)
+			continue;
+		if (entry->in_use > 0 || entry->relid == keep_relid)
+		{
+			remaining++;
+			continue;
+		}
+		if (entry->plan != NULL)
+			SPI_freeplan(entry->plan);
+		/* dynahash allows removing the entry just returned by the scan */
+		hash_search(audit_plan_cache, &entry->relid, HASH_REMOVE, NULL);
+	}
+	stale_entries = remaining;
 }
 
 void
@@ -128,6 +176,9 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 	int			paramidx;
 	int			i;
 
+	if (stale_entries > 0)
+		sweep_stale_plans(relid);
+
 	entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
 										   HASH_ENTER, &found);
 	if (!found)
@@ -136,12 +187,20 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 		entry->plan = NULL;
 		entry->nparams = 0;
 		entry->natts = 0;
+		entry->in_use = 0;
 	}
 
 	if (entry->valid && entry->plan != NULL && entry->natts == natts)
 		return entry;
 
-	/* Stale or new: drop the old plan (outside the invalidation callback) */
+	/*
+	 * Stale or new: drop the old plan (outside the invalidation callback).
+	 * A stale plan that is still executing (this trigger fired from inside
+	 * its own audit INSERT) cannot be replaced in place.
+	 */
+	if (entry->in_use > 0)
+		elog(ERROR, "pgaudix: audit plan for relation %u is stale while in use",
+			 relid);
 	entry->valid = false;
 	if (entry->plan != NULL)
 	{
@@ -265,7 +324,16 @@ insert_audit_row(const char *operation, HeapTuple tuple, Oid relid,
 	if (paramidx != entry->nparams)
 		elog(ERROR, "pgaudix: cached plan does not match the tuple descriptor");
 
-	ret = SPI_execute_plan(entry->plan, values, nulls, false, 0);
+	entry->in_use++;
+	PG_TRY();
+	{
+		ret = SPI_execute_plan(entry->plan, values, nulls, false, 0);
+	}
+	PG_FINALLY();
+	{
+		entry->in_use--;
+	}
+	PG_END_TRY();
 	if (ret != SPI_OK_INSERT)
 		elog(ERROR, "pgaudix: audit INSERT failed (SPI returned %d)", ret);
 

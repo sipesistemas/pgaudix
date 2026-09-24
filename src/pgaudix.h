@@ -9,7 +9,4 @@
 #define AUDIT_OP_UPDATE "U"
 #define AUDIT_OP_DELETE "D"
 
-/* Number of fixed audit metadata columns in the audit table */
-#define AUDIT_META_COLS 8
-
 #endif /* PGAUDIX_H */
