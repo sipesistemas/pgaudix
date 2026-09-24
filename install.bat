@@ -13,8 +13,16 @@ for /f "delims=" %%i in ('"%PG_CONFIG%" --pkglibdir') do set "LIBDIR=%%i"
 for /f "delims=" %%i in ('"%PG_CONFIG%" --sharedir') do set "SHAREDIR=%%i"
 
 copy /Y pgaudix.dll "%LIBDIR%\pgaudix.dll"
+if errorlevel 1 goto :copy_failed
 copy /Y pgaudix.control "%SHAREDIR%\extension\pgaudix.control"
-copy /Y pgaudix--0.1.0.sql "%SHAREDIR%\extension\pgaudix--0.1.0.sql"
+if errorlevel 1 goto :copy_failed
+copy /Y pgaudix--*.sql "%SHAREDIR%\extension\"
+if errorlevel 1 goto :copy_failed
 
 echo pgaudix installed successfully.
 echo Connect to your database and run: CREATE EXTENSION pgaudix;
+exit /b 0
+
+:copy_failed
+echo ERROR: could not copy the extension files. Run this script from the folder that contains pgaudix.dll, as an administrator if PostgreSQL is installed under Program Files.
+exit /b 1
