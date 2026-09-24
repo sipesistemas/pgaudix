@@ -248,6 +248,18 @@ Then reconnect or reload the extension:
 docker compose exec pgaudix bash -c "cd /pgaudix && make USE_PGXS=1 installcheck"
 ```
 
+### Benchmark
+
+`make USE_PGXS=1 bench` runs `test/bench.sql`: 200k-row INSERT, UPDATE and DELETE on a 6-column table with and without auditing, best of three rounds. It is a measurement, not a CI test: numbers depend on the machine, so compare runs on the same host. Reference on a developer laptop (PostgreSQL 17 in Docker):
+
+| Operation | No audit | Audited | Audit cost per row |
+|-----------|---------:|--------:|-------------------:|
+| INSERT    |    84 ms | 1319 ms |             6.2 µs |
+| UPDATE    |   110 ms | 1375 ms |             6.3 µs |
+| DELETE    |    37 ms | 1294 ms |             6.3 µs |
+
+The remaining cost is the INSERT into the audit table (primary key and timestamp index); the trigger caches its plan per relation.
+
 ### Project structure
 
 ```
@@ -256,12 +268,13 @@ pgaudix/
 ├── docker-compose.yml          # Dev environment on port 5433
 ├── Makefile                    # PGXS build system
 ├── pgaudix.control            # Extension metadata
-├── pgaudix--0.2.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── pgaudix--0.3.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
 ├── install.sh / install.bat   # Install a release build (Linux/macOS, Windows)
 ├── src/
 │   ├── pgaudix.h              # Constants and declarations
 │   └── pgaudix.c              # C trigger function (SPI-based DML auditing)
 ├── test/
+│   ├── bench.sql                   # Benchmark (make bench)
 │   ├── sql/
 │   │   ├── pgaudix_test.sql        # Regression test input
 │   │   └── pgaudix_generated.sql   # PostgreSQL 18+ only (virtual generated columns)
