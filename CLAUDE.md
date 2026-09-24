@@ -8,15 +8,15 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 
 - **Hybrid C + PL/pgSQL**: C for DML trigger (performance), PL/pgSQL for API and DDL event trigger (maintainability)
 - **Storage model**: Single copy of mirrored columns. One row per operation with current values. Operations: `I` (insert), `U` (update, new values), `D` (delete, old values), `T` (truncate, NULL data).
-- **DDL sync**: Event trigger on `ddl_command_end` compares source `pg_attribute` against audit `pg_attribute` using attnum offset to detect ADD/DROP/RENAME/TYPE CHANGE. Audit table attnums are aligned with source via gap fillers in `enable()`. Uses OID-based lookup for RENAME TABLE support.
-- **Security**: All SECURITY DEFINER functions use `SET search_path`. C trigger validates tgargs format. Audit tables are write-protected (REVOKE from PUBLIC). Concurrent enable() calls are serialized.
+- **DDL sync**: Event trigger on `ddl_command_end` compares source `pg_attribute` against audit `pg_attribute` using attnum offset to detect DROP/ADD/RENAME/TYPE CHANGE (in that order, by attnum). Altered tables are expanded to their inheritance children and partitions. Audit table attnums are aligned with source via gap fillers in `enable()`. Uses OID-based lookup for RENAME TABLE support; `heal_registry()` re-resolves OIDs by name after pg_dump/restore. Type changes use an explicit cast and fall back to `text`; domains are mirrored with their base type (`audit_type()`). Per-partition TRUNCATE triggers are reconciled by `sync_partition_triggers()`.
+- **Recursion guard**: `pgaudix.ddl_guard` table (one row per backend pid while `ddl_sync()`/`enable()` run their own DDL). Not a GUC, so it cannot be set by users.
+- **Security**: All functions are SECURITY DEFINER with `SET search_path = pgaudix, pg_catalog, pg_temp` and `REVOKE EXECUTE FROM PUBLIC`; `enable()`/`disable()` check table ownership via `pgaudix.invoker()` (the `role` GUC, else `session_user`). C trigger validates tgargs format. Audit tables are write-protected (REVOKE from PUBLIC). Concurrent enable() calls are serialized. Event and DML triggers are ENABLE ALWAYS.
 
 ## Key Files
 
 - `src/pgaudix.c` — C DML trigger function using SPI
 - `pgaudix--0.2.0.sql` — full SQL install script for fresh installs (current version)
-- `pgaudix--0.1.0.sql` — full SQL install script for legacy 0.1.0 (kept for upgrade path)
-- `pgaudix--0.1.0--0.2.0.sql` — upgrade delta applied by `ALTER EXTENSION pgaudix UPDATE`
+- Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--0.2.0--X.Y.Z.sql` delta; never rewrite a released script in place
 - `Makefile` — PGXS build (`make USE_PGXS=1`)
 - `pgaudix.control` — Extension metadata
 
@@ -24,12 +24,14 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 
 - `pgaudix.enable(target_table regclass)` — Start auditing a table (creates `_audit` table + trigger)
 - `pgaudix.disable(target_table regclass, drop_data bool DEFAULT false)` — Stop auditing
-- `pgaudix.status()` — List all monitored tables
+- `pgaudix.status()` — List all monitored tables with integrity flags
+- Internal helpers (not for users): `heal_registry()`, `sync_partition_triggers()`, `audit_type()`, `check_table_owner()`, `invoker()`
 
 ## Conventions
 
 - All code, comments, function names, and error messages in **English**
-- Audit metadata columns prefixed with `audit_` (audit_id, audit_operation, audit_timestamp, etc.)
+- Audit metadata columns prefixed with `audit_` (audit_id, audit_operation, audit_timestamp, audit_txid, audit_user, audit_client_addr, audit_app_name, audit_app_user); `audit_app_user` is the last one and defines the attnum offset used by DDL sync
+- `audit_app_user` comes from the `pgaudix.app_user` GUC that the application sets per transaction (`SET LOCAL`)
 - Mirrored columns keep their original names
 - Extension schema: `pgaudix`
 - Version: 0.2.0
@@ -57,3 +59,8 @@ docker compose exec pgaudix bash -c "cd /pgaudix && make USE_PGXS=1 install"
 # Run regression tests
 docker compose exec pgaudix bash -c "cd /pgaudix && make USE_PGXS=1 installcheck"
 ```
+
+## Testing conventions
+
+- Bug fixes are done TDD-style: add a numbered block to `test/sql/pgaudix_test.sql`, run `installcheck` to see it fail, fix, review `regression.diffs`, then promote `results/pgaudix_test.out` to `test/expected/`.
+- Scenarios pg_regress cannot drive (real pg_dump/restore, other login roles) are verified ad hoc in the container and described in the test comments.

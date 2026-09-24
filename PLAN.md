@@ -23,6 +23,7 @@ CREATE TABLE public.orders_audit (
     audit_user          name NOT NULL DEFAULT session_user,
     audit_client_addr   inet DEFAULT inet_client_addr(),
     audit_app_name      text DEFAULT current_setting('application_name'),
+    audit_app_user      text DEFAULT current_setting('pgaudix.app_user', true),
     -- Mirrored columns
     id                  int,
     amount              numeric,
@@ -45,22 +46,25 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - Uses parameterized `SPI_execute_with_args()` with error checking
 - `SECURITY DEFINER` with `SET search_path` for audit table write access
 
-### SQL install script (`pgaudix--0.1.0.sql`)
+### SQL install script (`pgaudix--0.2.0.sql`)
 - `pgaudix.monitored_tables` — registration table with `source_oid` for OID-based lookup
 - `pgaudix.enable(regclass)` — creates audit table (with attnum gap alignment), triggers, registration. Serialized with LOCK TABLE.
 - `pgaudix.disable(regclass, bool)` — drops triggers, optionally drops audit table
 - `pgaudix.status()` — lists monitored tables
 - `pgaudix.truncate_trigger()` — PL/pgSQL AFTER TRUNCATE trigger (statement-level)
-- `pgaudix.ddl_sync()` — event trigger for ALTER TABLE: detects ADD/DROP/RENAME/TYPE CHANGE columns. On RENAME TABLE, automatically renames the audit table and recreates triggers with updated references. Blocks direct ALTER on audit tables. Uses recursion guard via `set_config`.
+- `pgaudix.ddl_sync()` — event trigger for ALTER TABLE / ALTER SCHEMA: detects DROP/ADD/RENAME/TYPE CHANGE columns (attnum order) on the altered tables and their descendants. On RENAME TABLE / SET SCHEMA, renames the audit table and recreates triggers. Warns on direct ALTER of audit tables. Recursion guard: `pgaudix.ddl_guard` table.
+- `pgaudix.drop_cleanup()` — sql_drop event trigger removing registry rows of dropped sources
+- Helpers: `heal_registry()` (OIDs after restore), `sync_partition_triggers()` (per-leaf TRUNCATE triggers), `audit_type()` (domain base types), `check_table_owner()` / `invoker()` (privilege checks)
 
 ### Security
-- All SECURITY DEFINER functions use `SET search_path = pgaudix, pg_catalog`
-- Audit tables: `REVOKE INSERT, UPDATE, DELETE FROM PUBLIC`
+- All SECURITY DEFINER functions use `SET search_path = pgaudix, pg_catalog, pg_temp`
+- All functions: `REVOKE EXECUTE FROM PUBLIC`; `enable()`/`disable()` require table ownership
+- Audit tables: `REVOKE INSERT, UPDATE, DELETE, TRUNCATE FROM PUBLIC`
 - C trigger validates tgargs format
 - `enable()` serialized with `LOCK TABLE ... IN EXCLUSIVE MODE`
 - `audit_user` uses `session_user` (not `current_user`) for authentic identity
 
-## Test Cases (27 tests)
+## Test Cases (56 tests + PG18-only virtual generated columns file)
 
 1. Enable auditing
 2. INSERT audit
@@ -89,3 +93,32 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 25. Enable on non-existent table
 26. Disable on non-monitored table
 27. Attnum gap alignment (enable on table with dropped columns, DML + DDL sync with gaps)
+28. REVOKE includes TRUNCATE
+29. Corrupted audit table (missing metadata column) is detected
+30. Views and materialized views are rejected
+31. Names that would overflow NAMEDATALEN are rejected
+32. CHECK constraint on audit_operation
+33. DROP TABLE on source removes the registry row
+34. ALTER SCHEMA RENAME keeps audit in sync
+35. status() integrity columns
+36. Registry survives pg_dump/restore (config dump + stale OID healing)
+37. ALTER COLUMN TYPE needing USING keeps the source writable (cast, text fallback)
+38. Source columns named like gap fillers are left alone
+39. pg_temp cannot shadow types used by the API functions
+40. DROP and ADD of the same column name in one statement
+41. ADD COLUMN order does not depend on the pg_attribute scan plan
+42. DDL propagated through inheritance / partitioning is synced
+43. Partition-leaf TRUNCATE triggers follow RENAME, ATTACH and DETACH
+44. DDL sync and drop cleanup run under replica role
+45. The recursion guard cannot be forged by a regular role
+46. Functions closed to PUBLIC; enable/disable check ownership
+47. One T row per TRUNCATE statement on a partitioned table
+48. Domain columns are mirrored with the base type
+49. A broken registry row does not affect DDL on other tables
+50. The extension's own tables cannot be audited
+51. DDL after the first audited row in the same session (plan cache invalidation, partitions)
+52. audit_app_user records the application user set via the pgaudix.app_user GUC
+53. Dropping the source drops its audit table
+54. No dead "enabled" flag in the registry
+55. Scenarios inherited from the retired bug-confirmation script (two ALTERs in one txn, SET SCHEMA, multibyte name, 1600 limit, UNLOGGED)
+56. Reserved metadata names in ADD / RENAME COLUMN give a clear error

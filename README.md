@@ -75,9 +75,23 @@ This creates `orders_audit` in the same schema with:
 | `audit_user`        | `name`                   | User who performed the action   |
 | `audit_client_addr` | `inet`                   | Client IP address               |
 | `audit_app_name`    | `text`                   | Application name                |
+| `audit_app_user`    | `text`                   | Application user, see below     |
 | `id`                | `integer`                | *(mirrored from source)*        |
 | `amount`            | `numeric(10,2)`          | *(mirrored from source)*        |
 | `status`            | `text`                   | *(mirrored from source)*        |
+
+### Identifying the application user
+
+`audit_user` is the PostgreSQL role of the connection. An application that connects with a single role (the usual SaaS setup) records that role on every row, so it also reports the end user through a session variable, once per transaction or request:
+
+```sql
+BEGIN;
+SET LOCAL pgaudix.app_user = 'user-4711';   -- or: SELECT set_config('pgaudix.app_user', 'user-4711', true);
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+COMMIT;
+```
+
+The audit row stores it in `audit_app_user`; it is NULL when nothing was set. `SET LOCAL` ends with the transaction, so connection pools are safe. The value is whatever the application declares, so trust it as much as you trust the application; `audit_user` remains the authenticated identity.
 
 ### How operations are recorded
 
@@ -152,21 +166,32 @@ ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,4);
 
 -- Drop a column
 ALTER TABLE orders DROP COLUMN description;
--- orders_audit column is dropped too
+-- orders_audit column is dropped too (its audit history goes with it)
 
 -- Rename the table
 ALTER TABLE orders RENAME TO orders_v2;
 -- orders_audit is renamed to orders_v2_audit, triggers updated automatically
 ```
 
+Details worth knowing:
+
+- **Type changes** are applied to the audit table with an explicit cast (`USING column::newtype`). If the audit history cannot be converted (for example `int` to `uuid`, or narrowing `text` to `varchar(3)` with longer values already logged), the audit column is converted to `text` instead and a `WARNING` is raised: history is preserved and auditing keeps working. An audit column of type `text` is never changed again.
+- **Domains** are mirrored with their base type (`numeric(8,2)` for a domain over it), so `NOT NULL` or `CHECK` constraints of the domain do not reject the NULL data of `T` rows.
+- **Inheritance and partitions**: changes made through a parent table (`ALTER TABLE parent ADD COLUMN`) are synced to audited children and partitions.
+- **Partitioned tables**: every partition gets a `TRUNCATE` trigger so that truncating a partition directly is audited. Partitions attached or detached later, and renames of the root, are reconciled automatically. A `TRUNCATE` statement writes a single `T` row, whether it names the root or one partition.
+- **`session_replication_role = replica`**: DML, TRUNCATE and DDL sync keep working (all triggers are `ENABLE ALWAYS`).
+
 ### Check monitored tables
 
 ```sql
-SELECT * FROM pgaudix.status();
---  source_schema | source_table | audit_schema |    audit_table    | enabled |          created_at
--- ---------------+--------------+--------------+-------------------+---------+-------------------------------
---  public        | orders       | public       | orders_audit      | t       | 2026-03-25 12:00:00.000000+00
+SELECT source_table, audit_table, audit_table_exists, dml_trigger_enabled, truncate_trigger_enabled
+FROM pgaudix.status();
+--  source_table | audit_table  | audit_table_exists | dml_trigger_enabled | truncate_trigger_enabled
+-- --------------+--------------+--------------------+---------------------+--------------------------
+--  orders       | orders_audit | t                  | t                   | t
 ```
+
+`status()` returns one row per monitored table with `source_schema`, `source_table`, `audit_schema`, `audit_table`, `created_at`, plus integrity checks: `audit_table_exists`, `dml_trigger_exists`, `dml_trigger_enabled`, `truncate_trigger_exists` and `truncate_trigger_enabled`. A `false` in any of the last five means someone changed the audit objects behind pgaudix's back.
 
 ### Disable auditing
 
@@ -182,9 +207,26 @@ SELECT pgaudix.disable('orders', drop_data := true);
 
 | Function | Description |
 |----------|-------------|
-| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and trigger. |
-| `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. |
-| `pgaudix.status()` | List all monitored tables with their status. |
+| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and triggers. Caller must own the table or be a superuser. |
+| `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. Same ownership rule. |
+| `pgaudix.status()` | List all monitored tables with integrity checks. |
+
+### Privileges
+
+`CREATE EXTENSION pgaudix` requires a superuser. None of the functions is executable by `PUBLIC`. To let a role manage auditing of the tables it owns:
+
+```sql
+GRANT USAGE ON SCHEMA pgaudix TO app_admin;
+GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass),
+                          pgaudix.disable(regclass, boolean),
+                          pgaudix.status() TO app_admin;
+```
+
+Audit tables are owned by the extension owner. Grant `SELECT` on `<table>_audit` explicitly to whoever needs to read the log.
+
+### Backup and restore
+
+The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use, so `status()`, `disable()` and DDL sync keep working without manual steps.
 
 ## Development
 
@@ -214,22 +256,29 @@ pgaudix/
 ├── docker-compose.yml          # Dev environment on port 5433
 ├── Makefile                    # PGXS build system
 ├── pgaudix.control            # Extension metadata
-├── pgaudix--0.1.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── pgaudix--0.2.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── install.sh / install.bat   # Install a release build (Linux/macOS, Windows)
 ├── src/
 │   ├── pgaudix.h              # Constants and declarations
 │   └── pgaudix.c              # C trigger function (SPI-based DML auditing)
-└── test/
-    ├── sql/
-    │   └── pgaudix_test.sql   # Regression test input
-    └── expected/
-        └── pgaudix_test.out   # Expected test output
+├── test/
+│   ├── sql/
+│   │   ├── pgaudix_test.sql        # Regression test input
+│   │   └── pgaudix_generated.sql   # PostgreSQL 18+ only (virtual generated columns)
+│   └── expected/
+│       ├── pgaudix_test.out
+│       └── pgaudix_generated.out
+└── .github/workflows/          # CI (tests on PG 16/17/18) and release builds
 ```
 
 ## Security
 
-- All API functions (`enable`, `disable`, `ddl_sync`) use `SECURITY DEFINER` with an explicit `SET search_path` to prevent search path injection
+- All functions use `SECURITY DEFINER` with `SET search_path = pgaudix, pg_catalog, pg_temp` (`pg_temp` last, so temporary objects cannot shadow types or functions)
+- No function is executable by `PUBLIC`; `enable()` and `disable()` also require the caller to own the target table (see *Privileges*)
+- The trigger functions cannot be attached to other tables by non-superusers, so audit rows cannot be forged
 - The C trigger function validates its arguments against injection attacks
-- Audit tables are protected: `INSERT`, `UPDATE`, and `DELETE` are revoked from `PUBLIC` — only the trigger (running as `SECURITY DEFINER`) can write audit rows
+- Audit tables are protected: `INSERT`, `UPDATE`, `DELETE` and `TRUNCATE` are revoked from `PUBLIC` — only the trigger (running as `SECURITY DEFINER`) can write audit rows
+- The DDL-sync recursion guard is a table in the `pgaudix` schema, not a settable parameter, so it cannot be used to switch the sync off
 - The `audit_user` column captures `session_user` (the authenticated identity) rather than `current_user`, so it cannot be spoofed via `SET ROLE`
 - Concurrent `enable()` calls are serialized with an explicit lock to prevent race conditions
 - The `enable()` function rejects duplicate registrations
@@ -238,8 +287,13 @@ pgaudix/
 ## Known Limitations
 
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
-- Source columns starting with `audit_` will work but may cause confusion when reading the audit table
-- Maximum of ~796 columns per source table (audit table has mirrored columns + 7 metadata columns, PostgreSQL limit is 1600)
+- Source columns starting with `audit_` will work but may cause confusion when reading the audit table; the seven metadata names themselves are rejected
+- The audit table reserves one column slot per source attnum (dropped columns included) plus 8 metadata columns, so the source's highest attnum must be at most 1592 (PostgreSQL limit is 1600)
+- Dropping a source column drops the mirrored column and its history; dropping a source table drops its audit table (use `disable()` first to keep the data)
+- An UPDATE that moves a row between partitions is recorded as `D` + `I` (PostgreSQL fires no UPDATE trigger for it)
+- `audit_user` is `session_user`; actions performed after `SET ROLE` are attributed to the login role (use `audit_app_user` to identify the acting user)
+- The Windows build is compiled with MSYS2/mingw and tested against the MSYS2 PostgreSQL; loading it into an EDB (MSVC) installation has not been verified
+- There is no automatic retention: audit tables grow until a superuser deletes old rows (`DELETE FROM orders_audit WHERE audit_timestamp < ...`). Renaming an audit table by hand is reverted by the DDL sync on purpose; use `disable()` first if you need to move it
 
 ## License
 
