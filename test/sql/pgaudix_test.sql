@@ -1217,11 +1217,15 @@ CREATE DOMAIN public.test_nn_int AS int NOT NULL;
 CREATE DOMAIN public.test_pos AS numeric(8,2) CHECK (VALUE > 0);
 CREATE DOMAIN public.test_nested AS public.test_pos;
 
+CREATE DOMAIN public.test_tag AS text CHECK (VALUE <> '');
+
 CREATE TABLE public.test_dom (
-    id int,
-    a  public.test_nn_int,
-    b  public.test_pos,
-    c  public.test_nested
+    id   int,
+    a    public.test_nn_int,
+    b    public.test_pos,
+    c    public.test_nested,
+    tags public.test_tag[],
+    amts public.test_pos[]
 );
 SELECT pgaudix.enable('public.test_dom');
 
@@ -1231,13 +1235,20 @@ WHERE table_schema = 'public' AND table_name = 'test_dom_audit'
   AND column_name IN ('a', 'b', 'c')
 ORDER BY ordinal_position;
 
-INSERT INTO public.test_dom VALUES (1, 2, 3.5, 4.25);
+-- Arrays of a domain are mirrored as arrays of the base type
+SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS audit_type
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = 'public.test_dom_audit'::regclass
+  AND a.attname IN ('tags', 'amts')
+ORDER BY a.attnum;
+
+INSERT INTO public.test_dom VALUES (1, 2, 3.5, 4.25, ARRAY['x', 'y'], ARRAY[1.5]);
 TRUNCATE public.test_dom;
 
 -- DDL sync must apply the same rule for added and retyped columns
 ALTER TABLE public.test_dom ADD COLUMN d public.test_nn_int;
 ALTER TABLE public.test_dom ALTER COLUMN id TYPE public.test_nn_int USING id;
-INSERT INTO public.test_dom VALUES (2, 5, 6.5, 7.25, 8);
+INSERT INTO public.test_dom VALUES (2, 5, 6.5, 7.25, NULL, NULL, 8);
 TRUNCATE public.test_dom;
 
 -- and must not keep trying to "convert" the audit columns afterwards
@@ -1249,12 +1260,13 @@ WHERE table_schema = 'public' AND table_name = 'test_dom_audit'
   AND column_name IN ('id', 'd')
 ORDER BY ordinal_position;
 
-SELECT audit_operation, id, a, b, c, d
+SELECT audit_operation, id, a, b, c, tags, amts, d
 FROM public.test_dom_audit
 ORDER BY audit_id;
 
 SELECT pgaudix.disable('public.test_dom', drop_data := true);
 DROP TABLE public.test_dom;
+DROP DOMAIN public.test_tag;
 DROP DOMAIN public.test_nested;
 DROP DOMAIN public.test_pos;
 DROP DOMAIN public.test_nn_int;
@@ -1629,8 +1641,22 @@ SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
 INSERT INTO public.test_heal_src VALUES (1);
 SELECT audit_operation, id FROM public.test_heal_src_audit;
 
-SELECT pgaudix.disable('public.test_heal_src', drop_data := true);
+-- Same collision, but the real source lost its trigger (restore where the
+-- .so was missing): the row cannot be healed, and dropping the colliding
+-- table must still leave the audit table alone
+CREATE TABLE public.test_heal_other (id int);
+DROP TRIGGER pgaudix_audit_trigger ON public.test_heal_src;
+UPDATE pgaudix.monitored_tables
+SET source_oid = 'public.test_heal_other'::regclass
+WHERE source_table = 'test_heal_src';
+DROP TABLE public.test_heal_other;
+SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
+       (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
+
+-- Dropping the real source (by name, stale OID) cleans up as usual
 DROP TABLE public.test_heal_src;
+SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
+       (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
 DROP TABLE IF EXISTS public.test_heal_other_audit;
 
 -- ============================================================
@@ -1719,11 +1745,21 @@ TRUNCATE public.test_trunc2_mid;                         -- intermediate: 1
 TRUNCATE public.test_trunc2_mid_a;                       -- leaf: 1
 TRUNCATE public.test_trunc2_p1, public.test_trunc2_part; -- leaf + root: 1
 TRUNCATE public.test_trunc2_p1, public.test_trunc2_p2;   -- two leaves: 2
+TRUNCATE public.test_trunc2_mid, public.test_trunc2_part; -- intermediate + root: 1
+TRUNCATE public.test_trunc2_mid_a, public.test_trunc2_mid; -- leaf + intermediate: 1
+DO $$
+BEGIN
+    TRUNCATE public.test_trunc2_mid;                       -- 1
+    TRUNCATE public.test_trunc2_part;                      -- 1
+    TRUNCATE public.test_trunc2_mid_b;                     -- 1
+END;
+$$;
 
 SELECT audit_operation, count(*)
 FROM public.test_trunc2_part_audit
 GROUP BY audit_operation
 ORDER BY audit_operation;
+-- 11 T rows expected (1+1+1+1+2+1+1+3), no pending records left
 SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
 
 SELECT pgaudix.disable('public.test_trunc2_part', drop_data := true);

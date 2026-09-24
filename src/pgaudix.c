@@ -48,8 +48,11 @@ typedef struct AuditPlanEntry
 
 static HTAB *audit_plan_cache = NULL;
 
-/* Number of entries marked stale by the callback and not yet swept */
-static int	stale_entries = 0;
+/*
+ * Set when an entry may need sweeping: marked stale by the callback, or
+ * created and not (yet) built (SPI_prepare may have failed after HASH_ENTER).
+ */
+static bool sweep_needed = false;
 
 /*
  * Columns the trigger does not write: dropped columns, and virtual generated
@@ -85,10 +88,10 @@ audit_plan_cache_callback(Datum arg, Oid relid)
 	{
 		entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
 											   HASH_FIND, NULL);
-		if (entry != NULL && entry->valid)
+		if (entry != NULL)
 		{
 			entry->valid = false;
-			stale_entries++;
+			sweep_needed = true;
 		}
 	}
 	else
@@ -97,13 +100,8 @@ audit_plan_cache_callback(Datum arg, Oid relid)
 
 		hash_seq_init(&status, audit_plan_cache);
 		while ((entry = (AuditPlanEntry *) hash_seq_search(&status)) != NULL)
-		{
-			if (entry->valid)
-			{
-				entry->valid = false;
-				stale_entries++;
-			}
-		}
+			entry->valid = false;
+		sweep_needed = true;
 	}
 }
 
@@ -134,7 +132,8 @@ sweep_stale_plans(Oid keep_relid)
 		/* dynahash allows removing the entry just returned by the scan */
 		hash_search(audit_plan_cache, &entry->relid, HASH_REMOVE, NULL);
 	}
-	stale_entries = remaining;
+	/* entries still in use (or the caller's) are swept on a later call */
+	sweep_needed = (remaining > 0);
 }
 
 void
@@ -176,7 +175,7 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 	int			paramidx;
 	int			i;
 
-	if (stale_entries > 0)
+	if (sweep_needed)
 		sweep_stale_plans(relid);
 
 	entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
@@ -188,6 +187,8 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 		entry->nparams = 0;
 		entry->natts = 0;
 		entry->in_use = 0;
+		/* if SPI_prepare below fails, the empty entry is swept next time */
+		sweep_needed = true;
 	}
 
 	if (entry->valid && entry->plan != NULL && entry->natts == natts)

@@ -38,11 +38,13 @@ SELECT pg_catalog.pg_extension_config_dump('pgaudix.monitored_tables_id_seq', ''
 -- leaf triggers will follow so they do not each write a duplicate T row. A
 -- table (not a GUC) so it cannot be set by users to hide a TRUNCATE.
 CREATE TABLE pgaudix.truncate_pending (
-    pid        integer NOT NULL,
-    audit_key  text    NOT NULL,   -- schema.table of the audit table
-    xid        bigint  NOT NULL,   -- txid_current() of the TRUNCATE
-    remaining  integer NOT NULL,
-    PRIMARY KEY (pid, audit_key)
+    pid          integer NOT NULL,
+    audit_key    text    NOT NULL,   -- schema.table of the audit table
+    writer_relid oid     NOT NULL,   -- partitioned relation that wrote the T row
+    xid          bigint  NOT NULL,   -- txid_current() of the TRUNCATE
+    audit_id     bigint  NOT NULL,   -- the T row it wrote
+    remaining    integer NOT NULL,   -- descendants' triggers still to fire
+    PRIMARY KEY (pid, audit_key, writer_relid)
 );
 
 CREATE TABLE pgaudix.ddl_guard (
@@ -168,52 +170,114 @@ AS $func$
 DECLARE
     v_key       text := TG_ARGV[0] || '.' || TG_ARGV[1];
     v_relkind   "char";
-    v_pending   integer;
     v_remaining integer;
+    v_writer    oid;
+    v_total     integer;
+    v_fired     integer := 0;
+    v_keep      bigint;
+    v_audit_id  bigint;
+    rec         record;
 BEGIN
     -- One TRUNCATE statement fires this trigger on every relation it
     -- truncates: the partitioned root, intermediate partitioned tables and
     -- every leaf (each carries its own copy so that a direct TRUNCATE of a
     -- partition is audited). Partitioned relations use a BEFORE trigger and
-    -- leaves an AFTER trigger, and PostgreSQL fires all BEFORE statement
-    -- triggers of a TRUNCATE before any AFTER one, so the topmost truncated
-    -- table always runs first: it records the T row and how many of the
-    -- other triggers will follow in this statement; those stay quiet.
+    -- leaves an AFTER trigger; PostgreSQL fires all BEFORE statement triggers
+    -- of a TRUNCATE before any AFTER one, in the order of the statement's
+    -- relation list. A partitioned relation records the T row and how many
+    -- of its descendants' triggers will follow in this statement; those find
+    -- the record of an ancestor and stay quiet. If a descendant was listed
+    -- before its ancestor, the ancestor absorbs the descendant's record.
 
     -- Quiet if an ancestor recorded this statement already
-    UPDATE pgaudix.truncate_pending
-    SET remaining = remaining - 1
-    WHERE pid = pg_backend_pid() AND audit_key = v_key
-      AND xid = txid_current() AND remaining > 0
-    RETURNING remaining INTO v_remaining;
+    UPDATE pgaudix.truncate_pending p
+    SET remaining = p.remaining - 1
+    WHERE p.pid = pg_backend_pid() AND p.audit_key = v_key
+      AND p.xid = txid_current() AND p.remaining > 0
+      AND p.writer_relid IN (
+          WITH RECURSIVE up(relid) AS (
+              SELECT i.inhparent FROM pg_catalog.pg_inherits i WHERE i.inhrelid = TG_RELID
+              UNION
+              SELECT i.inhparent FROM pg_catalog.pg_inherits i JOIN up ON i.inhrelid = up.relid
+          )
+          SELECT relid FROM up
+      )
+    RETURNING p.remaining, p.writer_relid INTO v_remaining, v_writer;
 
-    IF v_remaining IS NOT NULL THEN
+    IF FOUND THEN
         IF v_remaining = 0 THEN
             DELETE FROM pgaudix.truncate_pending
-            WHERE pid = pg_backend_pid() AND audit_key = v_key;
+            WHERE pid = pg_backend_pid() AND audit_key = v_key AND writer_relid = v_writer;
         END IF;
         RETURN NULL;
     END IF;
 
-    EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
-                   TG_ARGV[0], TG_ARGV[1]);
-
     SELECT c.relkind INTO v_relkind FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
-    IF v_relkind = 'p' THEN
-        SELECT count(*) INTO v_pending
-        FROM pg_catalog.pg_partition_tree(TG_RELID) pt
-        JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
-        WHERE pt.relid <> TG_RELID
-          AND t.tgname = 'pgaudix_truncate_trigger'
-          AND NOT t.tgisinternal
-          AND t.tgenabled <> 'D';
 
-        DELETE FROM pgaudix.truncate_pending
-        WHERE pid = pg_backend_pid() AND audit_key = v_key;
-        IF v_pending > 0 THEN
-            INSERT INTO pgaudix.truncate_pending (pid, audit_key, xid, remaining)
-            VALUES (pg_backend_pid(), v_key, txid_current(), v_pending);
+    IF v_relkind <> 'p' THEN
+        EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
+                       TG_ARGV[0], TG_ARGV[1]);
+        RETURN NULL;
+    END IF;
+
+    -- Descendants whose trigger will fire in this statement
+    SELECT count(*) INTO v_total
+    FROM pg_catalog.pg_partition_tree(TG_RELID) pt
+    JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
+    WHERE pt.relid <> TG_RELID
+      AND t.tgname = 'pgaudix_truncate_trigger'
+      AND NOT t.tgisinternal
+      AND t.tgenabled <> 'D';
+
+    -- Absorb the records of descendants that were listed before this
+    -- relation in the same statement: keep one T row, drop the others, and
+    -- count the triggers of their subtrees that already fired
+    FOR rec IN
+        SELECT p.writer_relid, p.audit_id, p.remaining,
+               (SELECT count(*)
+                FROM pg_catalog.pg_partition_tree(p.writer_relid) pt
+                JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
+                WHERE pt.relid <> p.writer_relid
+                  AND t.tgname = 'pgaudix_truncate_trigger'
+                  AND NOT t.tgisinternal
+                  AND t.tgenabled <> 'D') AS total
+        FROM pgaudix.truncate_pending p
+        WHERE p.pid = pg_backend_pid() AND p.audit_key = v_key
+          AND p.xid = txid_current()
+          AND p.writer_relid IN (
+              SELECT pt.relid FROM pg_catalog.pg_partition_tree(TG_RELID) pt
+              WHERE pt.relid <> TG_RELID)
+        ORDER BY p.audit_id
+    LOOP
+        v_fired := v_fired + (rec.total - rec.remaining) + 1;
+        IF v_keep IS NULL THEN
+            v_keep := rec.audit_id;
+        ELSE
+            EXECUTE format('DELETE FROM %I.%I WHERE audit_id = $1',
+                           TG_ARGV[0], TG_ARGV[1]) USING rec.audit_id;
         END IF;
+        DELETE FROM pgaudix.truncate_pending
+        WHERE pid = pg_backend_pid() AND audit_key = v_key
+          AND writer_relid = rec.writer_relid;
+    END LOOP;
+
+    IF v_keep IS NULL THEN
+        EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'') RETURNING audit_id',
+                       TG_ARGV[0], TG_ARGV[1]) INTO v_audit_id;
+    ELSE
+        v_audit_id := v_keep;
+    END IF;
+
+    -- A record of ours left by an earlier statement of this transaction
+    -- (a descendant trigger that did not fire) is superseded
+    DELETE FROM pgaudix.truncate_pending
+    WHERE pid = pg_backend_pid() AND audit_key = v_key AND writer_relid = TG_RELID;
+
+    IF v_total - v_fired > 0 THEN
+        INSERT INTO pgaudix.truncate_pending
+            (pid, audit_key, writer_relid, xid, audit_id, remaining)
+        VALUES (pg_backend_pid(), v_key, TG_RELID, txid_current(), v_audit_id,
+                v_total - v_fired);
     END IF;
 
     RETURN NULL;
@@ -234,6 +298,9 @@ LANGUAGE sql
 STABLE
 SET search_path = pgaudix, pg_catalog, pg_temp
 AS $func$
+    -- Walk a domain (or a domain over a domain) down to its base type. An
+    -- array whose element type is a domain is rebuilt as an array of the
+    -- element's base type, so domain constraints never bind audit columns.
     WITH RECURSIVE walk(typid, typmod, depth) AS (
         SELECT p_typid, p_typmod, 0
         UNION ALL
@@ -241,11 +308,33 @@ AS $func$
         FROM walk w
         JOIN pg_catalog.pg_type t ON t.oid = w.typid
         WHERE t.typtype = 'd' AND w.depth < 32
+    ),
+    base AS (
+        SELECT w.typid, w.typmod FROM walk w ORDER BY w.depth DESC LIMIT 1
+    ),
+    elem AS (
+        WITH RECURSIVE ewalk(typid, typmod, depth) AS (
+            SELECT t.typelem, b.typmod, 0
+            FROM base b
+            JOIN pg_catalog.pg_type t ON t.oid = b.typid
+            WHERE t.typelem <> 0
+              AND t.typsubscript = 'pg_catalog.array_subscript_handler'::regproc
+            UNION ALL
+            SELECT t.typbasetype, t.typtypmod, e.depth + 1
+            FROM ewalk e
+            JOIN pg_catalog.pg_type t ON t.oid = e.typid
+            WHERE t.typtype = 'd' AND e.depth < 32
+        )
+        SELECT e.typid, e.typmod, e.depth FROM ewalk e ORDER BY e.depth DESC LIMIT 1
     )
-    SELECT format_type(w.typid, w.typmod)
-    FROM walk w
-    ORDER BY w.depth DESC
-    LIMIT 1;
+    SELECT CASE
+               WHEN e.depth > 0 AND eb.typarray <> 0
+                   THEN format_type(eb.typarray, e.typmod)
+               ELSE format_type(b.typid, b.typmod)
+           END
+    FROM base b
+    LEFT JOIN elem e ON true
+    LEFT JOIN pg_catalog.pg_type eb ON eb.oid = e.typid;
 $func$;
 
 -- ============================================================
@@ -551,6 +640,13 @@ BEGIN
         END IF;
     END LOOP;
 
+    -- Hold the DDL-sync recursion guard for the rest of enable(): the CREATE
+    -- TABLE of the audit table, the ALTERs on it and the ALTER TABLE ...
+    -- ENABLE ALWAYS on the source would otherwise fire ddl_sync before the
+    -- table is registered.
+    INSERT INTO pgaudix.ddl_guard (pid) VALUES (pg_backend_pid())
+    ON CONFLICT (pid) DO NOTHING;
+
     -- Create the audit table. Mirror the source table's persistence so an
     -- UNLOGGED source is not audited by a durable (permanent) table (bug #10).
     EXECUTE format(
@@ -568,12 +664,6 @@ BEGIN
         CASE WHEN v_relpersist = 'u' THEN 'UNLOGGED' ELSE '' END,
         v_audit_fqn, v_cols
     );
-
-    -- Hold the DDL-sync recursion guard for the rest of enable(): the ALTERs
-    -- on the audit table and the ALTER TABLE ... ENABLE ALWAYS on the source
-    -- would otherwise fire ddl_sync before the table is registered.
-    INSERT INTO pgaudix.ddl_guard (pid) VALUES (pg_backend_pid())
-    ON CONFLICT (pid) DO NOTHING;
 
     -- Drop exactly the gap fillers created above to leave matching attnum holes
     FOREACH v_gap IN ARRAY v_gap_cols LOOP
@@ -837,10 +927,6 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pgaudix.ddl_guard WHERE pid = pg_backend_pid()) THEN
         RETURN;
     END IF;
-    INSERT INTO pgaudix.ddl_guard (pid) VALUES (pg_backend_pid());
-
-    -- Re-bind registry rows whose OIDs went stale (pg_dump/restore)
-    PERFORM pgaudix.heal_registry();
 
     -- pg_event_trigger_ddl_commands() reports only the table named in an
     -- ALTER TABLE. Column changes propagate to inheritance children and
@@ -872,6 +958,39 @@ BEGIN
     FROM pg_event_trigger_ddl_commands() dc
     WHERE dc.command_tag = 'CREATE TABLE'
       AND dc.object_type = 'table';
+
+    -- Nothing to do unless the command touched a monitored table, an audit
+    -- table, or a relation under a monitored partitioned root. Matched by
+    -- OID and by name (after a restore the registered OIDs are stale). This
+    -- keeps every unrelated CREATE TABLE / ALTER TABLE in the database (temp
+    -- tables included) free of registry writes and the guard row.
+    IF NOT EXISTS (
+        WITH RECURSIVE up(relid) AS (
+            SELECT relid FROM unnest(v_affected_tables || v_created_tables) AS t(relid)
+            UNION
+            SELECT i.inhparent
+            FROM pg_catalog.pg_inherits i
+            JOIN up ON i.inhrelid = up.relid
+        ),
+        named AS (
+            SELECT up.relid, n.nspname, c.relname
+            FROM up
+            JOIN pg_catalog.pg_class c ON c.oid = up.relid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        )
+        SELECT 1
+        FROM pgaudix.monitored_tables mt
+        JOIN named ON named.relid IN (mt.source_oid, mt.audit_oid)
+                   OR (named.nspname, named.relname) IN ((mt.source_schema, mt.source_table),
+                                                         (mt.audit_schema, mt.audit_table))
+    ) THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO pgaudix.ddl_guard (pid) VALUES (pg_backend_pid());
+
+    -- Re-bind registry rows whose OIDs went stale (pg_dump/restore)
+    PERFORM pgaudix.heal_registry();
 
     -- ----------------------------------------------------------------
     -- Pre-pass: sync source_schema / source_table / audit_schema /
@@ -1273,17 +1392,19 @@ BEGIN
         FROM pg_event_trigger_dropped_objects()
         WHERE object_type = 'table'
     LOOP
-        -- Match by OID. The name is only a fallback for rows whose OID no
-        -- longer exists (restore, not healed because the trigger was missing):
-        -- a row with a valid OID identifies its table by that OID, and an
-        -- unrelated table that merely carries the recorded name must not
-        -- deregister it.
+        -- The dropped table must carry the registered name (ddl_sync keeps
+        -- the registered names equal to pg_class, so a registered OID that
+        -- was reused by a differently named table after a restore never
+        -- matches) and either the registered OID or a stale one (restore,
+        -- not healed because the trigger was missing). An unrelated table
+        -- that merely carries the recorded name, while the registered OID is
+        -- still valid, must not deregister it.
         FOR mon IN
             SELECT mt.*
             FROM pgaudix.monitored_tables mt
-            WHERE mt.source_oid = obj.objid
-               OR (mt.source_schema = obj.schema_name AND mt.source_table = obj.object_name
-                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.source_oid))
+            WHERE (mt.source_schema, mt.source_table) = (obj.schema_name, obj.object_name)
+              AND (mt.source_oid = obj.objid
+                   OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.source_oid))
         LOOP
             -- Drop the audit table if it still exists (a DROP SCHEMA ... CASCADE
             -- may have removed it in the same statement)
