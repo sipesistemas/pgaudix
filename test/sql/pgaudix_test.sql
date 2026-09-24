@@ -1698,6 +1698,34 @@ FROM public.test_trunc2_part_audit
 GROUP BY audit_operation
 ORDER BY audit_operation;
 
+-- Two-level tree: the intermediate partitioned table has no data of its
+-- own but is truncated as a unit, and a statement naming a leaf together
+-- with the root still counts as one TRUNCATE
+CREATE TABLE public.test_trunc2_mid PARTITION OF public.test_trunc2_part
+    FOR VALUES IN (3) PARTITION BY LIST (id);
+CREATE TABLE public.test_trunc2_mid_a PARTITION OF public.test_trunc2_mid FOR VALUES IN (1);
+CREATE TABLE public.test_trunc2_mid_b PARTITION OF public.test_trunc2_mid FOR VALUES IN (2);
+
+SELECT tgrelid::regclass AS rel,
+       CASE WHEN tgtype & 2 = 2 THEN 'BEFORE' ELSE 'AFTER' END AS timing
+FROM pg_catalog.pg_trigger
+WHERE tgname = 'pgaudix_truncate_trigger'
+  AND tgrelid::regclass::text LIKE 'test_trunc2_%'
+ORDER BY tgrelid::regclass::text;
+
+TRUNCATE public.test_trunc2_part_audit;
+TRUNCATE public.test_trunc2_part;                        -- root: 1
+TRUNCATE public.test_trunc2_mid;                         -- intermediate: 1
+TRUNCATE public.test_trunc2_mid_a;                       -- leaf: 1
+TRUNCATE public.test_trunc2_p1, public.test_trunc2_part; -- leaf + root: 1
+TRUNCATE public.test_trunc2_p1, public.test_trunc2_p2;   -- two leaves: 2
+
+SELECT audit_operation, count(*)
+FROM public.test_trunc2_part_audit
+GROUP BY audit_operation
+ORDER BY audit_operation;
+SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
+
 SELECT pgaudix.disable('public.test_trunc2_part', drop_data := true);
 DROP TABLE public.test_trunc2_part;
 SELECT pgaudix.disable('public.test_trunc2', drop_data := true);

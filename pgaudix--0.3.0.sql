@@ -168,35 +168,19 @@ AS $func$
 DECLARE
     v_key       text := TG_ARGV[0] || '.' || TG_ARGV[1];
     v_relkind   "char";
-    v_leaves    integer;
+    v_pending   integer;
     v_remaining integer;
 BEGIN
-    SELECT c.relkind INTO v_relkind FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
+    -- One TRUNCATE statement fires this trigger on every relation it
+    -- truncates: the partitioned root, intermediate partitioned tables and
+    -- every leaf (each carries its own copy so that a direct TRUNCATE of a
+    -- partition is audited). Partitioned relations use a BEFORE trigger and
+    -- leaves an AFTER trigger, and PostgreSQL fires all BEFORE statement
+    -- triggers of a TRUNCATE before any AFTER one, so the topmost truncated
+    -- table always runs first: it records the T row and how many of the
+    -- other triggers will follow in this statement; those stay quiet.
 
-    IF v_relkind = 'p' THEN
-        -- TRUNCATE of a partitioned root fires this trigger on the root first
-        -- and then on every leaf (each leaf carries its own copy so that a
-        -- direct TRUNCATE of a partition is audited). Record one T row here
-        -- and tell the leaf triggers of this statement to stay quiet.
-        EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
-                       TG_ARGV[0], TG_ARGV[1]);
-
-        SELECT count(*) INTO v_leaves
-        FROM pg_catalog.pg_partition_tree(TG_RELID) pt
-        JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
-        WHERE pt.relid <> TG_RELID
-          AND t.tgname = 'pgaudix_truncate_trigger'
-          AND NOT t.tgisinternal
-          AND t.tgenabled <> 'D';
-
-        DELETE FROM pgaudix.truncate_pending WHERE pid = pg_backend_pid();
-        INSERT INTO pgaudix.truncate_pending (pid, audit_key, xid, remaining)
-        VALUES (pg_backend_pid(), v_key, txid_current(), v_leaves);
-        RETURN NULL;
-    END IF;
-
-    -- Leaf (or plain table): quiet only while the root's TRUNCATE of this
-    -- same transaction still has leaf triggers pending
+    -- Quiet if an ancestor recorded this statement already
     UPDATE pgaudix.truncate_pending
     SET remaining = remaining - 1
     WHERE pid = pg_backend_pid() AND audit_key = v_key
@@ -213,6 +197,25 @@ BEGIN
 
     EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
                    TG_ARGV[0], TG_ARGV[1]);
+
+    SELECT c.relkind INTO v_relkind FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
+    IF v_relkind = 'p' THEN
+        SELECT count(*) INTO v_pending
+        FROM pg_catalog.pg_partition_tree(TG_RELID) pt
+        JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
+        WHERE pt.relid <> TG_RELID
+          AND t.tgname = 'pgaudix_truncate_trigger'
+          AND NOT t.tgisinternal
+          AND t.tgenabled <> 'D';
+
+        DELETE FROM pgaudix.truncate_pending
+        WHERE pid = pg_backend_pid() AND audit_key = v_key;
+        IF v_pending > 0 THEN
+            INSERT INTO pgaudix.truncate_pending (pid, audit_key, xid, remaining)
+            VALUES (pg_backend_pid(), v_key, txid_current(), v_pending);
+        END IF;
+    END IF;
+
     RETURN NULL;
 END;
 $func$;
@@ -319,14 +322,19 @@ DECLARE
     rec       record;
     v_tgargs  bytea;
 BEGIN
-    -- Ensure every leaf of every monitored partitioned root has the trigger
+    -- Ensure every member of every monitored partition tree (leaves and
+    -- intermediate partitioned tables) has the trigger: BEFORE on partitioned
+    -- relations, AFTER on leaves (see truncate_trigger())
     FOR rec IN
-        SELECT pt.relid AS leaf, mt.audit_schema, mt.audit_table
+        SELECT pt.relid AS leaf, mt.audit_schema, mt.audit_table,
+               CASE WHEN c.relkind = 'p' THEN 'BEFORE' ELSE 'AFTER' END AS timing,
+               -- tgtype: TRIGGER_TYPE_TRUNCATE (32) [| TRIGGER_TYPE_BEFORE (2)]
+               CASE WHEN c.relkind = 'p' THEN 34 ELSE 32 END AS tgtype
         FROM pgaudix.monitored_tables mt
         JOIN pg_catalog.pg_class root ON root.oid = mt.source_oid AND root.relkind = 'p'
         CROSS JOIN LATERAL pg_catalog.pg_partition_tree(mt.source_oid) pt
         JOIN pg_catalog.pg_class c ON c.oid = pt.relid
-        WHERE pt.isleaf AND c.relkind = 'r'
+        WHERE pt.relid <> mt.source_oid AND c.relkind IN ('r', 'p')
         ORDER BY pt.relid
     LOOP
         -- pg_trigger.tgargs stores each argument as a NUL-terminated string
@@ -339,6 +347,7 @@ BEGIN
               AND t.tgname = 'pgaudix_truncate_trigger'
               AND NOT t.tgisinternal
               AND t.tgenabled = 'A'
+              AND t.tgtype = rec.tgtype
               AND t.tgargs = v_tgargs
         );
 
@@ -355,9 +364,9 @@ BEGIN
         END IF;
         EXECUTE format(
             'CREATE TRIGGER pgaudix_truncate_trigger '
-            'AFTER TRUNCATE ON %s '
+            '%s TRUNCATE ON %s '
             'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
-            rec.leaf::regclass, rec.audit_schema, rec.audit_table
+            rec.timing, rec.leaf::regclass, rec.audit_schema, rec.audit_table
         );
         EXECUTE format(
             'ALTER TABLE %s ENABLE ALWAYS TRIGGER pgaudix_truncate_trigger',
@@ -601,11 +610,13 @@ BEGIN
         v_schema, v_table
     );
 
-    -- Create the TRUNCATE audit trigger (M1), also ENABLE ALWAYS (bug #4)
+    -- Create the TRUNCATE audit trigger (M1), also ENABLE ALWAYS (bug #4).
+    -- BEFORE on a partitioned table, AFTER on a plain one (see truncate_trigger())
     EXECUTE format(
         'CREATE TRIGGER pgaudix_truncate_trigger '
-        'AFTER TRUNCATE ON %I.%I '
+        '%s TRUNCATE ON %I.%I '
         'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
+        CASE WHEN v_relkind = 'p' THEN 'BEFORE' ELSE 'AFTER' END,
         v_schema, v_table, v_schema, v_audit
     );
     EXECUTE format(
@@ -963,8 +974,10 @@ BEGIN
 
         EXECUTE format(
             'CREATE TRIGGER pgaudix_truncate_trigger '
-            'AFTER TRUNCATE ON %I.%I '
+            '%s TRUNCATE ON %I.%I '
             'FOR EACH STATEMENT EXECUTE FUNCTION pgaudix.truncate_trigger(%L, %L)',
+            (SELECT CASE WHEN c.relkind = 'p' THEN 'BEFORE' ELSE 'AFTER' END
+             FROM pg_catalog.pg_class c WHERE c.oid = mon.source_oid),
             v_new_schema, v_new_table, v_new_schema, v_new_audit
         );
         EXECUTE format(

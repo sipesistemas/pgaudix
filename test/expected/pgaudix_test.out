@@ -1881,7 +1881,7 @@ ORDER BY audit_id;
 -- The broken tables report their own problem only when they are altered
 ALTER TABLE public.test_broken ADD COLUMN y int;
 ERROR:  pgaudix: audit table public.test_broken_audit is missing — cannot sync DDL
-CONTEXT:  PL/pgSQL function ddl_sync() line 252 at RAISE
+CONTEXT:  PL/pgSQL function ddl_sync() line 254 at RAISE
 ALTER TABLE public.test_conflict2 ADD COLUMN y int;
 ERROR:  relation "test_conflict2_audit" already exists
 CONTEXT:  SQL statement "ALTER TABLE public.test_conflict_audit RENAME TO test_conflict2_audit"
@@ -2540,6 +2540,50 @@ ORDER BY audit_operation;
  audit_operation | count 
 -----------------+-------
  T               |     2
+(1 row)
+
+-- Two-level tree: the intermediate partitioned table has no data of its
+-- own but is truncated as a unit, and a statement naming a leaf together
+-- with the root still counts as one TRUNCATE
+CREATE TABLE public.test_trunc2_mid PARTITION OF public.test_trunc2_part
+    FOR VALUES IN (3) PARTITION BY LIST (id);
+CREATE TABLE public.test_trunc2_mid_a PARTITION OF public.test_trunc2_mid FOR VALUES IN (1);
+CREATE TABLE public.test_trunc2_mid_b PARTITION OF public.test_trunc2_mid FOR VALUES IN (2);
+SELECT tgrelid::regclass AS rel,
+       CASE WHEN tgtype & 2 = 2 THEN 'BEFORE' ELSE 'AFTER' END AS timing
+FROM pg_catalog.pg_trigger
+WHERE tgname = 'pgaudix_truncate_trigger'
+  AND tgrelid::regclass::text LIKE 'test_trunc2_%'
+ORDER BY tgrelid::regclass::text;
+        rel        | timing 
+-------------------+--------
+ test_trunc2_mid   | BEFORE
+ test_trunc2_mid_a | AFTER
+ test_trunc2_mid_b | AFTER
+ test_trunc2_p1    | AFTER
+ test_trunc2_p2    | AFTER
+ test_trunc2_part  | BEFORE
+(6 rows)
+
+TRUNCATE public.test_trunc2_part_audit;
+TRUNCATE public.test_trunc2_part;                        -- root: 1
+TRUNCATE public.test_trunc2_mid;                         -- intermediate: 1
+TRUNCATE public.test_trunc2_mid_a;                       -- leaf: 1
+TRUNCATE public.test_trunc2_p1, public.test_trunc2_part; -- leaf + root: 1
+TRUNCATE public.test_trunc2_p1, public.test_trunc2_p2;   -- two leaves: 2
+SELECT audit_operation, count(*)
+FROM public.test_trunc2_part_audit
+GROUP BY audit_operation
+ORDER BY audit_operation;
+ audit_operation | count 
+-----------------+-------
+ T               |     6
+(1 row)
+
+SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
+ pending_rows 
+--------------
+            0
 (1 row)
 
 SELECT pgaudix.disable('public.test_trunc2_part', drop_data := true);
