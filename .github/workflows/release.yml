@@ -8,13 +8,31 @@ permissions:
   contents: write
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match default_version in pgaudix.control
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^default_version = '${VERSION}'$" pgaudix.control; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} does not match pgaudix.control:"
+            grep default_version pgaudix.control
+            exit 1
+          fi
+          test -f "pgaudix--${VERSION}.sql" || { echo "ERROR: pgaudix--${VERSION}.sql not found"; exit 1; }
+          echo "Releasing pgaudix ${VERSION}"
+
   build-linux:
+    needs: check-version
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [18, 17]
+        pg_version: [18, 17, 16]
 
     container:
       image: postgres:${{ matrix.pg_version }}
@@ -53,6 +71,7 @@ jobs:
           path: pgaudix-*-linux-amd64.tar.gz
 
   build-windows:
+    needs: check-version
     runs-on: windows-latest
 
     steps:
@@ -69,24 +88,32 @@ jobs:
             make
             zip
 
-      - name: Build extension
+      - name: Build and install extension
         shell: msys2 {0}
         run: |
           PG_VERSION=$(pg_config --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
           echo "Building for PostgreSQL $PG_VERSION"
           make USE_PGXS=1
+          make USE_PGXS=1 install
 
-      - name: Debug build output
+      # The MSYS2 PostgreSQL ships a server, so the regression suite runs here
+      # too. initdb/pg_ctl drop administrator privileges by themselves on
+      # Windows; pg_regress connects over TCP to localhost (trust by default).
+      - name: Run tests
         shell: msys2 {0}
         run: |
-          echo "=== Files in workspace ==="
-          ls -la
-          echo "=== pgaudix files ==="
-          find . -name 'pgaudix*' -type f
-          echo "=== pg_config --cflags ==="
-          pg_config --cflags || true
-          echo "=== DLSUFFIX ==="
-          pg_config --configure | tr ' ' '\n' | grep -i dll || true
+          export PGUSER=postgres
+          export PGHOST=127.0.0.1
+          initdb -D /tmp/pgdata -U postgres -A trust
+          pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-c listen_addresses=127.0.0.1" start
+          make USE_PGXS=1 installcheck
+
+      - name: Show test diff on failure
+        if: failure()
+        shell: msys2 {0}
+        run: |
+          cat regression.diffs || true
+          cat /tmp/pg.log || true
 
       - name: Package release
         shell: msys2 {0}
@@ -114,12 +141,13 @@ jobs:
           path: pgaudix-*-windows-amd64.zip
 
   build-macos-arm64:
+    needs: check-version
     runs-on: macos-14   # GitHub-hosted Apple Silicon (arm64)
 
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [18, 17]
+        pg_version: [18, 17, 16]
 
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +160,7 @@ jobs:
       - name: Build and install extension
         run: |
           PG_CONFIG="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin/pg_config"
-          echo "Building against $("$PG_CONFIG" --version) for $("$PG_CONFIG" --host || uname -m)"
+          echo "Building against $("$PG_CONFIG" --version) on $(uname -m)"
           make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
           make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
 
@@ -141,7 +169,8 @@ jobs:
           BREW_PG="$(brew --prefix postgresql@${{ matrix.pg_version }})"
           export PATH="$BREW_PG/bin:$PATH"
           export PGHOST=/tmp
-          initdb -D /tmp/pgdata
+          export PGUSER=postgres
+          initdb -D /tmp/pgdata -U postgres
           pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-k /tmp" start
           make USE_PGXS=1 PG_CONFIG="$BREW_PG/bin/pg_config" installcheck
 

@@ -8,3 +8,10 @@ test/**/*.out text eol=lf
 # C source files
 *.c text eol=lf
 *.h text eol=lf
+
+# Shell/Make/Docker files must stay LF even on Windows checkouts;
+# Windows batch files are CRLF
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+*.bat text eol=crlf

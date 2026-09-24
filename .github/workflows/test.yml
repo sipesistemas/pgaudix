@@ -43,3 +43,40 @@ jobs:
         if: failure()
         run: |
           cat regression.diffs || true
+
+  test-macos:
+    runs-on: macos-14   # GitHub-hosted Apple Silicon (arm64)
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [18, 17]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg_version }}
+        run: |
+          brew update
+          brew install postgresql@${{ matrix.pg_version }}
+
+      - name: Build and install extension
+        run: |
+          PG_CONFIG="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin/pg_config"
+          echo "Building against $("$PG_CONFIG" --version) on $(uname -m)"
+          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+
+      - name: Run tests
+        run: |
+          BREW_PG="$(brew --prefix postgresql@${{ matrix.pg_version }})"
+          export PATH="$BREW_PG/bin:$PATH"
+          export PGHOST=/tmp
+          export PGUSER=postgres
+          initdb -D /tmp/pgdata -U postgres
+          pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-k /tmp" start
+          make USE_PGXS=1 PG_CONFIG="$BREW_PG/bin/pg_config" installcheck
+
+      - name: Show test diff on failure
+        if: failure()
+        run: cat regression.diffs || true
