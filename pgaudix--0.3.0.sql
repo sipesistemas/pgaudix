@@ -33,6 +33,18 @@ SELECT pg_catalog.pg_extension_config_dump('pgaudix.monitored_tables_id_seq', ''
 -- owner, no PUBLIC access) is used instead of a custom GUC because any role
 -- can SET a custom GUC and silently disable the sync. Rows are always deleted
 -- before the statement ends, and a rollback removes them on error.
+-- TRUNCATE bookkeeping: while a TRUNCATE of a monitored partitioned root is
+-- running, its per-leaf triggers fire too. The root's trigger records how many
+-- leaf triggers will follow so they do not each write a duplicate T row. A
+-- table (not a GUC) so it cannot be set by users to hide a TRUNCATE.
+CREATE TABLE pgaudix.truncate_pending (
+    pid        integer NOT NULL,
+    audit_key  text    NOT NULL,   -- schema.table of the audit table
+    xid        bigint  NOT NULL,   -- txid_current() of the TRUNCATE
+    remaining  integer NOT NULL,
+    PRIMARY KEY (pid, audit_key)
+);
+
 CREATE TABLE pgaudix.ddl_guard (
     pid integer PRIMARY KEY
 );
@@ -46,6 +58,23 @@ CREATE TABLE pgaudix.ddl_guard (
 -- re-bound if it still carries the pgaudix DML trigger, so an unrelated table
 -- that reused the name of a dropped source is never captured.
 
+-- ============================================================
+-- reserved_columns(): the audit metadata column names
+-- ============================================================
+-- Single source of truth for the names a source column may not use. The
+-- last one (audit_app_user) defines the attnum offset used by ddl_sync().
+CREATE FUNCTION pgaudix.reserved_columns()
+RETURNS name[]
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $func$
+    SELECT ARRAY['audit_id', 'audit_operation', 'audit_timestamp', 'audit_txid',
+                 'audit_user', 'audit_client_addr', 'audit_app_name',
+                 'audit_app_user']::pg_catalog.name[]
+$func$;
+
 CREATE FUNCTION pgaudix.heal_registry()
 RETURNS void
 LANGUAGE plpgsql
@@ -57,12 +86,24 @@ DECLARE
     v_src_oid   oid;
     v_audit_oid oid;
 BEGIN
+    -- A stored OID is stale when it no longer exists OR when it now belongs
+    -- to a relation with a different name: after a restore the old OID may
+    -- have been reused by an unrelated table, and trusting it would make
+    -- ddl_sync() and disable() act on that table.
     FOR mon IN
         SELECT mt.*
         FROM pgaudix.monitored_tables mt
-        WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.source_oid)
+        WHERE NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_class c
+                  JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+                  WHERE c.oid = mt.source_oid
+                    AND n.nspname = mt.source_schema AND c.relname = mt.source_table)
            OR mt.audit_oid IS NULL
-           OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.audit_oid)
+           OR NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_class c
+                  JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+                  WHERE c.oid = mt.audit_oid
+                    AND n.nspname = mt.audit_schema AND c.relname = mt.audit_table)
     LOOP
         SELECT c.oid INTO v_src_oid
         FROM pg_catalog.pg_class c
@@ -79,6 +120,18 @@ BEGIN
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
         WHERE n.nspname = mon.audit_schema AND c.relname = mon.audit_table;
+
+        -- Name not found: keep the stored OID if it still is an audit table
+        -- (a RENAME / ALTER SCHEMA in progress, before ddl_sync() updates the
+        -- registered names); otherwise it is gone or reused by an unrelated
+        -- relation, and NULL is the safe answer.
+        IF v_audit_oid IS NULL AND EXISTS (
+            SELECT 1 FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid = mon.audit_oid
+              AND a.attname = 'audit_app_user' AND NOT a.attisdropped
+        ) THEN
+            v_audit_oid := mon.audit_oid;
+        END IF;
 
         IF (v_src_oid IS NOT NULL AND v_src_oid <> mon.source_oid)
            OR v_audit_oid IS DISTINCT FROM mon.audit_oid THEN
@@ -112,24 +165,54 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pgaudix, pg_catalog, pg_temp
 AS $func$
+DECLARE
+    v_key       text := TG_ARGV[0] || '.' || TG_ARGV[1];
+    v_relkind   "char";
+    v_leaves    integer;
+    v_remaining integer;
 BEGIN
-    -- TRUNCATE of a partitioned root fires this statement trigger on the root
-    -- and again on every partition (each leaf carries its own copy so that a
-    -- direct TRUNCATE of a partition is audited). All of those run inside one
-    -- statement, so statement_timestamp() is the same for them: write the T
-    -- row only if this statement has not written one to this audit table yet.
-    -- audit_timestamp defaults to clock_timestamp(), which is never earlier
-    -- than the statement start, and earlier statements in the same
-    -- transaction have an earlier statement_timestamp().
-    EXECUTE format(
-        'INSERT INTO %I.%I (audit_operation) '
-        'SELECT ''T'' WHERE NOT EXISTS ('
-        '    SELECT 1 FROM %I.%I '
-        '    WHERE audit_operation = ''T'' '
-        '      AND audit_txid = txid_current() '
-        '      AND audit_timestamp >= statement_timestamp())',
-        TG_ARGV[0], TG_ARGV[1], TG_ARGV[0], TG_ARGV[1]
-    );
+    SELECT c.relkind INTO v_relkind FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
+
+    IF v_relkind = 'p' THEN
+        -- TRUNCATE of a partitioned root fires this trigger on the root first
+        -- and then on every leaf (each leaf carries its own copy so that a
+        -- direct TRUNCATE of a partition is audited). Record one T row here
+        -- and tell the leaf triggers of this statement to stay quiet.
+        EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
+                       TG_ARGV[0], TG_ARGV[1]);
+
+        SELECT count(*) INTO v_leaves
+        FROM pg_catalog.pg_partition_tree(TG_RELID) pt
+        JOIN pg_catalog.pg_trigger t ON t.tgrelid = pt.relid
+        WHERE pt.relid <> TG_RELID
+          AND t.tgname = 'pgaudix_truncate_trigger'
+          AND NOT t.tgisinternal
+          AND t.tgenabled <> 'D';
+
+        DELETE FROM pgaudix.truncate_pending WHERE pid = pg_backend_pid();
+        INSERT INTO pgaudix.truncate_pending (pid, audit_key, xid, remaining)
+        VALUES (pg_backend_pid(), v_key, txid_current(), v_leaves);
+        RETURN NULL;
+    END IF;
+
+    -- Leaf (or plain table): quiet only while the root's TRUNCATE of this
+    -- same transaction still has leaf triggers pending
+    UPDATE pgaudix.truncate_pending
+    SET remaining = remaining - 1
+    WHERE pid = pg_backend_pid() AND audit_key = v_key
+      AND xid = txid_current() AND remaining > 0
+    RETURNING remaining INTO v_remaining;
+
+    IF v_remaining IS NOT NULL THEN
+        IF v_remaining = 0 THEN
+            DELETE FROM pgaudix.truncate_pending
+            WHERE pid = pg_backend_pid() AND audit_key = v_key;
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format('INSERT INTO %I.%I (audit_operation) VALUES (''T'')',
+                   TG_ARGV[0], TG_ARGV[1]);
     RETURN NULL;
 END;
 $func$;
@@ -259,10 +342,17 @@ BEGIN
               AND t.tgargs = v_tgargs
         );
 
-        EXECUTE format(
-            'DROP TRIGGER IF EXISTS pgaudix_truncate_trigger ON %s',
-            rec.leaf::regclass
-        );
+        IF EXISTS (
+            SELECT 1 FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid = rec.leaf
+              AND t.tgname = 'pgaudix_truncate_trigger'
+              AND NOT t.tgisinternal
+        ) THEN
+            EXECUTE format(
+                'DROP TRIGGER pgaudix_truncate_trigger ON %s',
+                rec.leaf::regclass
+            );
+        END IF;
         EXECUTE format(
             'CREATE TRIGGER pgaudix_truncate_trigger '
             'AFTER TRUNCATE ON %s '
@@ -373,12 +463,10 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM pg_catalog.pg_attribute a
         WHERE a.attrelid = target_table AND a.attnum > 0 AND NOT a.attisdropped
-          AND a.attname IN ('audit_id', 'audit_operation', 'audit_timestamp',
-                            'audit_txid', 'audit_user', 'audit_client_addr',
-                            'audit_app_name', 'audit_app_user')
+          AND a.attname = ANY (pgaudix.reserved_columns())
     ) THEN
-        RAISE EXCEPTION 'pgaudix: cannot audit %.%: a source column name collides with a reserved audit metadata column (audit_id, audit_operation, audit_timestamp, audit_txid, audit_user, audit_client_addr, audit_app_name, audit_app_user)',
-            v_schema, v_table;
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: a source column name collides with a reserved audit metadata column (%)',
+            v_schema, v_table, array_to_string(pgaudix.reserved_columns(), ', ');
     END IF;
 
     -- Reject tables whose attnum span would overflow the audit table column
@@ -429,10 +517,10 @@ BEGIN
         LEFT JOIN pg_catalog.pg_attribute a
           ON a.attrelid = target_table AND a.attnum = gs.n
          AND a.attnum > 0 AND NOT a.attisdropped
-         -- Virtual generated columns (PG18+) have no stored value: the trigger
-         -- would only ever see NULL, so they are not mirrored (their attnum
-         -- becomes a gap, like a dropped column)
-         AND a.attgenerated <> 'v'
+         -- Virtual generated columns (PG18+) have no stored value, so the C
+         -- trigger never writes them: they are mirrored as always-NULL columns.
+         -- A live column (not a dropped slot) keeps the attnum alignment
+         -- across pg_dump/restore, which does not recreate dropped columns.
         ORDER BY gs.n
     LOOP
         IF rec.attname IS NOT NULL THEN
@@ -578,7 +666,21 @@ BEGIN
     FROM pgaudix.monitored_tables
     WHERE source_oid = target_table;
 
-    IF NOT FOUND THEN
+    -- The row must describe this table: same registered name, or at least our
+    -- trigger on it. A stale OID reused by an unrelated table after a restore
+    -- (not healed because the real source lost its trigger) matches neither,
+    -- and dropping the audit table for it would destroy another table's log.
+    IF FOUND AND (mon.source_schema, mon.source_table) IS DISTINCT FROM (v_schema, v_table)
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_trigger t
+           WHERE t.tgrelid = target_table
+             AND t.tgname = 'pgaudix_audit_trigger'
+             AND NOT t.tgisinternal
+       ) THEN
+        mon := NULL;
+    END IF;
+
+    IF mon.id IS NULL THEN
         RAISE EXCEPTION 'pgaudix: table %.% is not monitored',
             v_schema, v_table;
     END IF;
@@ -629,26 +731,38 @@ RETURNS TABLE (
     truncate_trigger_exists  boolean,
     truncate_trigger_enabled boolean
 )
-LANGUAGE plpgsql
+LANGUAGE sql
+STABLE
 SECURITY DEFINER
 SET search_path = pgaudix, pg_catalog, pg_temp
 AS $func$
-BEGIN
-    -- Re-bind registry rows whose OIDs went stale (pg_dump/restore)
-    PERFORM pgaudix.heal_registry();
-
-    RETURN QUERY
+    -- Read-only on purpose: status() must work on a hot standby and inside a
+    -- read-only transaction. Stale OIDs (pg_dump/restore) are resolved by
+    -- name here; the registry itself is healed by enable()/disable()/DDL.
+    WITH reg AS (
+        SELECT mt.*,
+               COALESCE(
+                   (SELECT c.oid FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+                    WHERE c.oid = mt.source_oid
+                      AND n.nspname = mt.source_schema AND c.relname = mt.source_table),
+                   (SELECT c.oid FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = mt.source_schema AND c.relname = mt.source_table)
+               ) AS src
+        FROM pgaudix.monitored_tables mt
+    )
     SELECT
-        mt.source_schema, mt.source_table, mt.audit_schema, mt.audit_table,
-        mt.created_at,
+        reg.source_schema, reg.source_table, reg.audit_schema, reg.audit_table,
+        reg.created_at,
         EXISTS (
             SELECT 1 FROM pg_catalog.pg_class c
             JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = mt.audit_schema AND c.relname = mt.audit_table
+            WHERE n.nspname = reg.audit_schema AND c.relname = reg.audit_table
         ) AS audit_table_exists,
         EXISTS (
             SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mt.source_oid
+            WHERE t.tgrelid = reg.src
               AND t.tgname = 'pgaudix_audit_trigger'
               AND NOT t.tgisinternal
         ) AS dml_trigger_exists,
@@ -656,27 +770,26 @@ BEGIN
         -- trigger is 'A' (ENABLE ALWAYS) so it also fires under replica role (bug #4)
         EXISTS (
             SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mt.source_oid
+            WHERE t.tgrelid = reg.src
               AND t.tgname = 'pgaudix_audit_trigger'
               AND NOT t.tgisinternal
               AND t.tgenabled <> 'D'
         ) AS dml_trigger_enabled,
         EXISTS (
             SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mt.source_oid
+            WHERE t.tgrelid = reg.src
               AND t.tgname = 'pgaudix_truncate_trigger'
               AND NOT t.tgisinternal
         ) AS truncate_trigger_exists,
         EXISTS (
             SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mt.source_oid
+            WHERE t.tgrelid = reg.src
               AND t.tgname = 'pgaudix_truncate_trigger'
               AND NOT t.tgisinternal
               AND t.tgenabled <> 'D'
         ) AS truncate_trigger_enabled
-    FROM pgaudix.monitored_tables mt
-    ORDER BY mt.source_schema, mt.source_table;
-END;
+    FROM reg
+    ORDER BY reg.source_schema, reg.source_table;
 $func$;
 
 -- ============================================================
@@ -705,6 +818,7 @@ DECLARE
     v_cur_audit_name   name;
     v_altered_tables   oid[];   -- tables named by ALTER TABLE, plus descendants
     v_affected_tables  oid[];   -- those, plus every table of a schema named by ALTER SCHEMA
+    v_created_tables   oid[];   -- tables named by CREATE TABLE (new partitions)
 BEGIN
     -- Guard against recursive invocations from our own ALTERs on audit tables
     -- (see pgaudix.ddl_guard). The row MUST be removed before returning (bug #1)
@@ -740,6 +854,14 @@ BEGIN
     WHERE dc.command_tag = 'ALTER SCHEMA'
       AND c.relkind IN ('r', 'p');
 
+    -- CREATE TABLE ... PARTITION OF adds a leaf to a tree; it only matters
+    -- for the per-leaf TRUNCATE trigger reconciliation below
+    SELECT coalesce(array_agg(dc.objid), '{}')
+    INTO v_created_tables
+    FROM pg_event_trigger_ddl_commands() dc
+    WHERE dc.command_tag = 'CREATE TABLE'
+      AND dc.object_type = 'table';
+
     -- ----------------------------------------------------------------
     -- Pre-pass: sync source_schema / source_table / audit_schema /
     -- audit_table for the monitored entries touched by this command
@@ -763,6 +885,14 @@ BEGIN
 
         -- Source dropped — drop_cleanup will remove the row
         CONTINUE WHEN v_new_schema IS NULL;
+
+        -- Not our table (stale OID reused after a restore): leave it alone
+        CONTINUE WHEN NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid = mon.source_oid
+              AND t.tgname = 'pgaudix_audit_trigger'
+              AND NOT t.tgisinternal
+        );
 
         -- Current audit-table location (by OID — survives schema/table renames
         -- and tells us where the audit table ACTUALLY is, which differs between
@@ -852,8 +982,27 @@ BEGIN
     END LOOP;
 
     -- Reconcile per-leaf TRUNCATE triggers: covers RENAME / SET SCHEMA of a
-    -- partitioned root (new audit name) and ATTACH / DETACH PARTITION
-    PERFORM pgaudix.sync_partition_triggers();
+    -- partitioned root (new audit name), ATTACH / DETACH PARTITION and
+    -- CREATE TABLE ... PARTITION OF. Only when the command touched a monitored
+    -- partitioned root or a table under one (walking up pg_inherits from the
+    -- affected tables is cheap; scanning every monitored tree on every ALTER
+    -- TABLE in the database is not).
+    IF EXISTS (
+        WITH RECURSIVE up(relid) AS (
+            SELECT relid FROM unnest(v_affected_tables || v_created_tables) AS t(relid)
+            UNION
+            SELECT i.inhparent
+            FROM pg_catalog.pg_inherits i
+            JOIN up ON i.inhrelid = up.relid
+        )
+        SELECT 1
+        FROM up
+        JOIN pgaudix.monitored_tables mt ON mt.source_oid = up.relid
+        JOIN pg_catalog.pg_class c ON c.oid = mt.source_oid
+        WHERE c.relkind = 'p'
+    ) THEN
+        PERFORM pgaudix.sync_partition_triggers();
+    END IF;
 
     -- Sync every monitored table among the altered ones and their descendants
     FOR cmd IN
@@ -879,6 +1028,20 @@ BEGIN
         WHERE mt.source_oid = v_source_oid;
 
         IF NOT FOUND THEN
+            CONTINUE;
+        END IF;
+
+        -- A registered OID that was reused by another relation after a
+        -- restore (and could not be healed because the real source lost its
+        -- trigger) must not have its columns mirrored into the audit table.
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid = v_source_oid
+              AND t.tgname = 'pgaudix_audit_trigger'
+              AND NOT t.tgisinternal
+        ) THEN
+            RAISE WARNING 'pgaudix: %.% is registered but carries no pgaudix_audit_trigger; DDL not synced to the audit table',
+                mon.source_schema, mon.source_table;
             CONTINUE;
         END IF;
 
@@ -915,9 +1078,7 @@ BEGIN
             WHERE a.attrelid = v_source_oid
               AND a.attnum > 0
               AND NOT a.attisdropped
-              AND a.attname IN ('audit_id', 'audit_operation', 'audit_timestamp',
-                                'audit_txid', 'audit_user', 'audit_client_addr',
-                                'audit_app_name', 'audit_app_user')
+              AND a.attname = ANY (pgaudix.reserved_columns())
             ORDER BY a.attnum
         LOOP
             RAISE EXCEPTION 'pgaudix: column name "%" is reserved for audit metadata and cannot be used in audited table %.%',
@@ -954,7 +1115,7 @@ BEGIN
         -- attnums line up with the source's regardless of the scan plan)
         -- --------------------------------------------------------
         FOR cur IN
-            SELECT a.attnum, a.attname, a.attgenerated,
+            SELECT a.attnum, a.attname,
                    pgaudix.audit_type(a.atttypid, a.atttypmod) AS atttype
             FROM pg_catalog.pg_attribute a
             WHERE a.attrelid = v_source_oid
@@ -967,24 +1128,13 @@ BEGIN
               )
             ORDER BY a.attnum
         LOOP
-            IF cur.attgenerated = 'v' THEN
-                -- Virtual generated column (PG18+): not mirrored, but its attnum
-                -- must be consumed on the audit side too so later columns stay
-                -- aligned. Add and drop a placeholder to leave a dropped slot.
-                EXECUTE format(
-                    'ALTER TABLE %s ADD COLUMN %I int',
-                    v_audit_fqn, '_pgaudix_gap_' || cur.attnum
-                );
-                EXECUTE format(
-                    'ALTER TABLE %s DROP COLUMN %I',
-                    v_audit_fqn, '_pgaudix_gap_' || cur.attnum
-                );
-            ELSE
-                EXECUTE format(
-                    'ALTER TABLE %s ADD COLUMN %I %s',
-                    v_audit_fqn, cur.attname, cur.atttype
-                );
-            END IF;
+            -- A virtual generated column (PG18+) is added like any other: the
+            -- C trigger never writes it, so it stays NULL, but as a live column
+            -- it keeps the attnum alignment across pg_dump/restore.
+            EXECUTE format(
+                'ALTER TABLE %s ADD COLUMN %I %s',
+                v_audit_fqn, cur.attname, cur.atttype
+            );
         END LOOP;
 
         -- --------------------------------------------------------
@@ -1067,7 +1217,7 @@ $func$;
 -- Create the event trigger
 CREATE EVENT TRIGGER pgaudix_ddl_sync
     ON ddl_command_end
-    WHEN TAG IN ('ALTER TABLE', 'ALTER SCHEMA')
+    WHEN TAG IN ('ALTER TABLE', 'ALTER SCHEMA', 'CREATE TABLE')
     EXECUTE FUNCTION pgaudix.ddl_sync();
 
 -- The DML and TRUNCATE triggers are ENABLE ALWAYS so auditing keeps working
@@ -1093,18 +1243,34 @@ DECLARE
     obj record;
     mon record;
 BEGIN
+    -- Drops issued by enable()/ddl_sync() themselves (triggers, gap columns)
+    -- never remove a source table; healing in the middle of their work would
+    -- see half-renamed objects.
+    IF EXISTS (SELECT 1 FROM pgaudix.ddl_guard WHERE pid = pg_backend_pid()) THEN
+        RETURN;
+    END IF;
+
+    -- Re-bind rows whose OIDs went stale (pg_dump/restore) before matching, so
+    -- a stale OID that was reused by the table being dropped is re-resolved to
+    -- the real source instead of deregistering it.
+    PERFORM pgaudix.heal_registry();
+
     FOR obj IN
         SELECT objid, schema_name, object_name
         FROM pg_event_trigger_dropped_objects()
         WHERE object_type = 'table'
     LOOP
-        -- Match by OID, or by name for rows whose OID went stale after a
-        -- pg_dump/restore and was not healed yet.
+        -- Match by OID. The name is only a fallback for rows whose OID no
+        -- longer exists (restore, not healed because the trigger was missing):
+        -- a row with a valid OID identifies its table by that OID, and an
+        -- unrelated table that merely carries the recorded name must not
+        -- deregister it.
         FOR mon IN
             SELECT mt.*
             FROM pgaudix.monitored_tables mt
             WHERE mt.source_oid = obj.objid
-               OR (mt.source_schema = obj.schema_name AND mt.source_table = obj.object_name)
+               OR (mt.source_schema = obj.schema_name AND mt.source_table = obj.object_name
+                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.source_oid))
         LOOP
             -- Drop the audit table if it still exists (a DROP SCHEMA ... CASCADE
             -- may have removed it in the same statement)
@@ -1147,5 +1313,6 @@ REVOKE EXECUTE ON FUNCTION
     pgaudix.sync_partition_triggers(),
     pgaudix.check_table_owner(regclass),
     pgaudix.invoker(),
-    pgaudix.audit_type(oid, integer)
+    pgaudix.audit_type(oid, integer),
+    pgaudix.reserved_columns()
 FROM PUBLIC;

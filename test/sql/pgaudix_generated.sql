@@ -3,11 +3,13 @@
 CREATE EXTENSION pgaudix;
 
 -- ============================================================
--- Virtual generated columns are not mirrored
+-- Virtual generated columns are mirrored but never written
 -- ============================================================
--- A virtual column has no stored value, so the trigger would only ever see
--- NULL. It is left out of the audit table; its value can be derived from the
--- audited columns at any time. Stored generated columns are mirrored.
+-- A virtual column has no stored value, so the trigger never writes it: the
+-- audit column stays NULL and the value can be derived from the audited
+-- columns at any time. It is kept as a live column (not a dropped slot) so
+-- the attnum alignment survives pg_dump/restore. Stored generated columns
+-- are mirrored with their values.
 CREATE TABLE public.test_virtual (
     id int,
     a  int,
@@ -42,7 +44,7 @@ WHERE table_schema = 'public' AND table_name = 'test_virtual_audit'
   AND column_name NOT LIKE 'audit\_%'
 ORDER BY ordinal_position;
 
-SELECT audit_operation, id, a, s, b2, c
+SELECT audit_operation, id, a, v, s, b2, c
 FROM public.test_virtual_audit
 ORDER BY audit_id;
 
@@ -53,4 +55,54 @@ WHERE audit_operation = 'U';
 
 SELECT pgaudix.disable('public.test_virtual', drop_data := true);
 DROP TABLE public.test_virtual;
+
+-- ============================================================
+-- Virtual column slots survive a logical dump/restore
+-- ============================================================
+-- pg_dump does not recreate dropped columns. A placeholder that was dropped
+-- to reserve the virtual column's attnum disappears on restore, and the audit
+-- table must still line up with the source afterwards.
+CREATE TABLE public.test_virt_restore (
+    id int,
+    v  int GENERATED ALWAYS AS (id * 2) VIRTUAL,
+    s  text
+);
+SELECT pgaudix.enable('public.test_virt_restore');
+INSERT INTO public.test_virt_restore (id, s) VALUES (1, 'one');
+
+-- Simulate the restored audit table: same live columns, no dropped slots
+CREATE TABLE public.test_virt_restore_audit_new (LIKE public.test_virt_restore_audit INCLUDING ALL);
+INSERT INTO public.test_virt_restore_audit_new SELECT * FROM public.test_virt_restore_audit;
+ALTER SEQUENCE public.test_virt_restore_audit_audit_id_seq OWNED BY public.test_virt_restore_audit_new.audit_id;
+DROP TABLE public.test_virt_restore_audit;
+ALTER TABLE public.test_virt_restore_audit_new RENAME TO test_virt_restore_audit;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.test_virt_restore_audit FROM PUBLIC;
+
+ALTER TABLE public.test_virt_restore ADD COLUMN z int;
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_virt_restore_audit'
+  AND column_name NOT LIKE 'audit\_%'
+ORDER BY ordinal_position;
+
+INSERT INTO public.test_virt_restore (id, s, z) VALUES (2, 'two', 3);
+SELECT audit_operation, id, s, z
+FROM public.test_virt_restore_audit
+ORDER BY id;
+
+SELECT pgaudix.disable('public.test_virt_restore', drop_data := true);
+DROP TABLE public.test_virt_restore;
+
+-- ============================================================
+-- A source column named like a gap placeholder does not break DDL sync
+-- ============================================================
+CREATE TABLE public.test_gap_name (id int, "_pgaudix_gap_3" int);
+SELECT pgaudix.enable('public.test_gap_name');
+ALTER TABLE public.test_gap_name ADD COLUMN v int GENERATED ALWAYS AS (id + 1) VIRTUAL;
+ALTER TABLE public.test_gap_name ADD COLUMN c int;
+INSERT INTO public.test_gap_name (id, "_pgaudix_gap_3", c) VALUES (1, 2, 3);
+SELECT audit_operation, id, "_pgaudix_gap_3", c FROM public.test_gap_name_audit;
+SELECT pgaudix.disable('public.test_gap_name', drop_data := true);
+DROP TABLE public.test_gap_name;
+
 DROP EXTENSION pgaudix;

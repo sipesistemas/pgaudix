@@ -1586,6 +1586,172 @@ SELECT audit_operation, id, x FROM public.test_reserved_audit;
 SELECT pgaudix.disable('public.test_reserved', drop_data := true);
 DROP TABLE public.test_reserved;
 
+-- ============================================================
+-- Test 57: heal_registry() must not trust an OID that now belongs to another table
+-- ============================================================
+-- After pg_dump/restore the registry keeps the old OIDs. If one of them was
+-- reused by an unrelated relation in the new cluster, the row still has to be
+-- re-resolved by name; existence of the OID alone proves nothing.
+CREATE TABLE public.test_heal_src (id int);
+CREATE TABLE public.test_heal_other (id int);
+CREATE TABLE public.test_heal_other_audit (id int);
+SELECT pgaudix.enable('public.test_heal_src');
+
+-- Simulate the collision: both stored OIDs exist but belong to other relations
+UPDATE pgaudix.monitored_tables
+SET source_oid = 'public.test_heal_other'::regclass,
+    audit_oid  = 'public.test_heal_other_audit'::regclass
+WHERE source_table = 'test_heal_src';
+
+SELECT pgaudix.heal_registry();
+SELECT source_oid = 'public.test_heal_src'::regclass       AS source_healed,
+       audit_oid  = 'public.test_heal_src_audit'::regclass AS audit_healed
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_heal_src';
+
+-- DDL on the unrelated table must not touch it or the audit table
+ALTER TABLE public.test_heal_other ADD COLUMN x int;
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_heal_other_audit'
+ORDER BY ordinal_position;
+SELECT tgname FROM pg_catalog.pg_trigger
+WHERE tgrelid = 'public.test_heal_other'::regclass AND NOT tgisinternal;
+
+-- Dropping the unrelated table (colliding OID, no heal has run yet) must not
+-- drop the real audit table nor deregister the real source
+UPDATE pgaudix.monitored_tables
+SET source_oid = 'public.test_heal_other'::regclass
+WHERE source_table = 'test_heal_src';
+DROP TABLE public.test_heal_other;
+SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
+       (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
+INSERT INTO public.test_heal_src VALUES (1);
+SELECT audit_operation, id FROM public.test_heal_src_audit;
+
+SELECT pgaudix.disable('public.test_heal_src', drop_data := true);
+DROP TABLE public.test_heal_src;
+DROP TABLE IF EXISTS public.test_heal_other_audit;
+
+-- ============================================================
+-- Test 58: drop_cleanup() must only fall back to the name when the OID is stale
+-- ============================================================
+-- A registry row whose source_oid is still valid identifies its table by OID.
+-- Dropping an unrelated table that merely carries the recorded name must not
+-- drop the audit table nor delete the row.
+CREATE TABLE public.test_dc_src (id int);
+SELECT pgaudix.enable('public.test_dc_src');
+
+-- Simulate stale names with a valid OID
+UPDATE pgaudix.monitored_tables
+SET source_table = 'test_dc_unrelated'
+WHERE source_oid = 'public.test_dc_src'::regclass;
+
+CREATE TABLE public.test_dc_unrelated (id int);
+DROP TABLE public.test_dc_unrelated;
+
+SELECT to_regclass('public.test_dc_src_audit') IS NOT NULL AS audit_exists,
+       (SELECT count(*) FROM pgaudix.monitored_tables
+        WHERE source_oid = 'public.test_dc_src'::regclass) AS registry_rows;
+INSERT INTO public.test_dc_src VALUES (1);
+SELECT audit_operation, id FROM public.test_dc_src_audit;
+
+SELECT pgaudix.disable('public.test_dc_src', drop_data := true);
+DROP TABLE public.test_dc_src;
+
+-- ============================================================
+-- Test 59: every TRUNCATE is recorded, also inside one top-level statement
+-- ============================================================
+-- The partition dedup must not swallow a second TRUNCATE of the same table
+-- issued from a DO block or PL/pgSQL function (same statement_timestamp()).
+CREATE TABLE public.test_trunc2 (id int);
+SELECT pgaudix.enable('public.test_trunc2');
+
+DO $$
+BEGIN
+    TRUNCATE public.test_trunc2;
+    INSERT INTO public.test_trunc2 VALUES (1);
+    TRUNCATE public.test_trunc2;
+END;
+$$;
+
+SELECT audit_operation, count(*)
+FROM public.test_trunc2_audit
+GROUP BY audit_operation
+ORDER BY audit_operation;
+
+-- Partitioned root inside a DO block: one T per TRUNCATE statement, still
+CREATE TABLE public.test_trunc2_part (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_trunc2_p1 PARTITION OF public.test_trunc2_part FOR VALUES IN (1);
+CREATE TABLE public.test_trunc2_p2 PARTITION OF public.test_trunc2_part FOR VALUES IN (2);
+SELECT pgaudix.enable('public.test_trunc2_part');
+
+DO $$
+BEGIN
+    TRUNCATE public.test_trunc2_part;
+    TRUNCATE public.test_trunc2_part;
+END;
+$$;
+
+SELECT audit_operation, count(*)
+FROM public.test_trunc2_part_audit
+GROUP BY audit_operation
+ORDER BY audit_operation;
+
+SELECT pgaudix.disable('public.test_trunc2_part', drop_data := true);
+DROP TABLE public.test_trunc2_part;
+SELECT pgaudix.disable('public.test_trunc2', drop_data := true);
+DROP TABLE public.test_trunc2;
+
+-- ============================================================
+-- Test 60: status() works in a read-only transaction
+-- ============================================================
+-- status() is the inspection tool; it must work on a hot standby or under
+-- SET TRANSACTION READ ONLY even when the registry still has stale OIDs.
+CREATE TABLE public.test_ro (id int);
+SELECT pgaudix.enable('public.test_ro');
+
+-- Simulate a stale audit OID left by a restore
+UPDATE pgaudix.monitored_tables
+SET audit_oid = 0
+WHERE source_oid = 'public.test_ro'::regclass;
+
+BEGIN;
+SET TRANSACTION READ ONLY;
+SELECT source_table, audit_table, audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_ro';
+COMMIT;
+
+SELECT pgaudix.disable('public.test_ro', drop_data := true);
+DROP TABLE public.test_ro;
+
+-- ============================================================
+-- Test 61: a partition created after enable() gets its TRUNCATE trigger
+-- ============================================================
+-- CREATE TABLE ... PARTITION OF is not an ALTER TABLE; the event trigger
+-- must still reconcile the per-leaf triggers so a direct TRUNCATE of the
+-- new partition is audited.
+CREATE TABLE public.test_newpart (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_newpart_p1 PARTITION OF public.test_newpart FOR VALUES IN (1);
+SELECT pgaudix.enable('public.test_newpart');
+CREATE TABLE public.test_newpart_p2 PARTITION OF public.test_newpart FOR VALUES IN (2);
+
+SELECT tgrelid::regclass AS leaf, tgenabled
+FROM pg_catalog.pg_trigger
+WHERE tgname = 'pgaudix_truncate_trigger'
+  AND tgrelid IN ('public.test_newpart_p1'::regclass, 'public.test_newpart_p2'::regclass)
+ORDER BY tgrelid::regclass::text;
+
+TRUNCATE public.test_newpart_p2;
+SELECT audit_operation, count(*)
+FROM public.test_newpart_audit
+GROUP BY audit_operation
+ORDER BY audit_operation;
+
+SELECT pgaudix.disable('public.test_newpart', drop_data := true);
+DROP TABLE public.test_newpart;
+
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (
     id      serial PRIMARY KEY,
