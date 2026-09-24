@@ -7,7 +7,10 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
@@ -15,113 +18,258 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pgaudix_trigger);
 
 /*
- * Insert one audit row into the audit table.
+ * Per-backend cache of prepared audit INSERT statements, one per source
+ * relation (for a partitioned table: one per partition, since each partition
+ * has its own tuple descriptor).
  *
- * operation: one of "I", "U", "D"
- * tuple: the row data to record
- * tupdesc: tuple descriptor of the source table
- * audit_table: fully qualified audit table name (already quoted)
+ * Without it every audited row pays a full parse/analyze/plan of the INSERT,
+ * which costs more than the INSERT itself. The plan is built from the source
+ * tuple descriptor and the trigger argument (the audit table name), both of
+ * which only change through DDL on the source relation, and any such DDL
+ * invalidates the source's relcache entry in every backend. A relcache
+ * callback therefore marks the entry stale; it is rebuilt on next use. The
+ * plan is freed lazily (not inside the callback, which may run during abort
+ * processing). Changes to the audit table itself are tracked by PostgreSQL's
+ * own plan cache, which replans the saved statement.
+ */
+typedef struct AuditPlanEntry
+{
+	Oid			relid;			/* hash key: source relation OID */
+	bool		valid;			/* false once relid was invalidated */
+	SPIPlanPtr	plan;			/* saved plan (SPI_keepplan), or NULL */
+	int			nparams;		/* 1 (operation) + audited columns */
+	int			natts;			/* natts of the tupdesc the plan was built for */
+} AuditPlanEntry;
+
+static HTAB *audit_plan_cache = NULL;
+
+/*
+ * Columns that are not mirrored in the audit table: dropped columns, and
+ * virtual generated columns (PostgreSQL 18+), which carry no stored value
+ * and are left out by enable()/ddl_sync().
+ */
+static inline bool
+skip_attribute(Form_pg_attribute attr)
+{
+	if (attr->attisdropped)
+		return true;
+#ifdef ATTRIBUTE_GENERATED_VIRTUAL
+	if (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+		return true;
+#endif
+	return false;
+}
+
+/*
+ * Relcache invalidation callback: mark the entry for relid stale, or all
+ * entries when relid is InvalidOid (full cache reset).
  */
 static void
-insert_audit_row(const char *operation, HeapTuple tuple, TupleDesc tupdesc,
-				 const char *audit_table)
+audit_plan_cache_callback(Datum arg, Oid relid)
 {
+	AuditPlanEntry *entry;
+
+	if (audit_plan_cache == NULL)
+		return;
+
+	if (OidIsValid(relid))
+	{
+		entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
+											   HASH_FIND, NULL);
+		if (entry != NULL)
+			entry->valid = false;
+	}
+	else
+	{
+		HASH_SEQ_STATUS status;
+
+		hash_seq_init(&status, audit_plan_cache);
+		while ((entry = (AuditPlanEntry *) hash_seq_search(&status)) != NULL)
+			entry->valid = false;
+	}
+}
+
+void
+_PG_init(void)
+{
+	HASHCTL		ctl;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(AuditPlanEntry);
+	ctl.hcxt = TopMemoryContext;
+	audit_plan_cache = hash_create("pgaudix audit plan cache", 16, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	CacheRegisterRelcacheCallback(audit_plan_cache_callback, (Datum) 0);
+}
+
+/*
+ * Return the cached INSERT plan for the source relation, building it if the
+ * cache has no valid entry. Must be called with SPI connected.
+ *
+ * The statement is:
+ *   INSERT INTO "schema"."table_audit" (audit_operation, col1, ...)
+ *   VALUES ($1, $2, ...)
+ * with $1 = operation (text) and one parameter per audited source column,
+ * typed with the source column's type.
+ */
+static AuditPlanEntry *
+get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
+{
+	AuditPlanEntry *entry;
+	bool		found;
 	StringInfoData cols;
 	StringInfoData vals;
-	int			nparams;
-	int			natts = tupdesc->natts;
-	int			ncols = 0;
-	int			i;
-	Datum	   *values;
-	Oid		   *types;
-	char	   *nulls;
 	StringInfoData query;
+	Oid		   *argtypes;
+	int			natts = tupdesc->natts;
+	int			nparams;
+	int			paramidx;
+	int			i;
 
-	/* Count non-dropped columns */
-	for (i = 0; i < natts; i++)
+	entry = (AuditPlanEntry *) hash_search(audit_plan_cache, &relid,
+										   HASH_ENTER, &found);
+	if (!found)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-		if (!attr->attisdropped)
-			ncols++;
+		entry->valid = false;
+		entry->plan = NULL;
+		entry->nparams = 0;
+		entry->natts = 0;
 	}
 
-	/*
-	 * Parameters: $1 = operation (text)
-	 * + ncols data columns from the tuple
-	 * Total: 1 + ncols
-	 */
-	nparams = 1 + ncols;
+	if (entry->valid && entry->plan != NULL && entry->natts == natts)
+		return entry;
 
-	/* palloc never returns NULL — it ereports on OOM */
-	values = (Datum *) palloc(nparams * sizeof(Datum));
-	types = (Oid *) palloc(nparams * sizeof(Oid));
-	nulls = (char *) palloc(nparams * sizeof(char));
+	/* Stale or new: drop the old plan (outside the invalidation callback) */
+	entry->valid = false;
+	if (entry->plan != NULL)
+	{
+		SPI_freeplan(entry->plan);
+		entry->plan = NULL;
+	}
 
+	/* Count audited columns */
+	nparams = 1;
+	for (i = 0; i < natts; i++)
+	{
+		if (!skip_attribute(TupleDescAttr(tupdesc, i)))
+			nparams++;
+	}
+
+	argtypes = (Oid *) palloc(nparams * sizeof(Oid));
 	initStringInfo(&cols);
 	initStringInfo(&vals);
 
-	/* $1 = audit_operation */
-	values[0] = CStringGetTextDatum(operation);
-	types[0] = TEXTOID;
-	nulls[0] = ' ';
-
+	argtypes[0] = TEXTOID;
 	appendStringInfoString(&cols, "audit_operation");
 	appendStringInfoString(&vals, "$1");
 
-	/* Data columns from the tuple */
+	paramidx = 1;
+	for (i = 0; i < natts; i++)
 	{
-		int paramidx = 1; /* next parameter index (0-based in arrays, $2 in SQL) */
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-		for (i = 0; i < natts; i++)
-		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-			bool		isnull;
-			Datum		val;
+		if (skip_attribute(attr))
+			continue;
 
-			if (attr->attisdropped)
-				continue;
-
-			appendStringInfo(&cols, ", %s", quote_identifier(NameStr(attr->attname)));
-			appendStringInfo(&vals, ", $%d", paramidx + 1);
-
-			val = heap_getattr(tuple, attr->attnum, tupdesc, &isnull);
-
-			if (isnull)
-			{
-				values[paramidx] = (Datum) 0;
-				nulls[paramidx] = 'n';
-			}
-			else
-			{
-				values[paramidx] = val;
-				nulls[paramidx] = ' ';
-			}
-			types[paramidx] = attr->atttypid;
-
-			paramidx++;
-		}
+		appendStringInfo(&cols, ", %s", quote_identifier(NameStr(attr->attname)));
+		appendStringInfo(&vals, ", $%d", paramidx + 1);
+		argtypes[paramidx] = attr->atttypid;
+		paramidx++;
 	}
 
-	/* Build the INSERT query */
 	initStringInfo(&query);
-	appendStringInfo(&query,
-					 "INSERT INTO %s (%s) VALUES (%s)",
+	appendStringInfo(&query, "INSERT INTO %s (%s) VALUES (%s)",
 					 audit_table, cols.data, vals.data);
 
-	{
-		int	ret;
+	entry->plan = SPI_prepare(query.data, nparams, argtypes);
+	if (entry->plan == NULL)
+		elog(ERROR, "pgaudix: SPI_prepare failed: %s",
+			 SPI_result_code_string(SPI_result));
+	if (SPI_keepplan(entry->plan) != 0)
+		elog(ERROR, "pgaudix: SPI_keepplan failed");
 
-		ret = SPI_execute_with_args(query.data, nparams, types, values, nulls,
-									false, 0);
-		if (ret != SPI_OK_INSERT)
-			elog(ERROR, "pgaudix: audit INSERT failed (SPI returned %d)", ret);
-	}
+	entry->nparams = nparams;
+	entry->natts = natts;
+	entry->valid = true;
 
 	pfree(cols.data);
 	pfree(vals.data);
 	pfree(query.data);
+	pfree(argtypes);
+
+	return entry;
+}
+
+/*
+ * Insert one audit row into the audit table.
+ *
+ * operation: one of "I", "U", "D"
+ * tuple: the row data to record
+ * relid/tupdesc: the source relation and its tuple descriptor
+ * audit_table: fully qualified audit table name (already quoted)
+ */
+static void
+insert_audit_row(const char *operation, HeapTuple tuple, Oid relid,
+				 TupleDesc tupdesc, const char *audit_table)
+{
+	AuditPlanEntry *entry;
+	int			natts = tupdesc->natts;
+	Datum	   *values;
+	char	   *nulls;
+	int			paramidx;
+	int			i;
+	int			ret;
+
+	entry = get_audit_plan(relid, tupdesc, audit_table);
+
+	/* palloc never returns NULL — it ereports on OOM */
+	values = (Datum *) palloc(entry->nparams * sizeof(Datum));
+	nulls = (char *) palloc(entry->nparams * sizeof(char));
+
+	/* $1 = audit_operation */
+	values[0] = CStringGetTextDatum(operation);
+	nulls[0] = ' ';
+
+	/* Data columns from the tuple, in the order the plan was built */
+	paramidx = 1;
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		bool		isnull;
+		Datum		val;
+
+		if (skip_attribute(attr))
+			continue;
+
+		if (paramidx >= entry->nparams)
+			elog(ERROR, "pgaudix: cached plan does not match the tuple descriptor");
+
+		val = heap_getattr(tuple, attr->attnum, tupdesc, &isnull);
+
+		if (isnull)
+		{
+			values[paramidx] = (Datum) 0;
+			nulls[paramidx] = 'n';
+		}
+		else
+		{
+			values[paramidx] = val;
+			nulls[paramidx] = ' ';
+		}
+
+		paramidx++;
+	}
+
+	if (paramidx != entry->nparams)
+		elog(ERROR, "pgaudix: cached plan does not match the tuple descriptor");
+
+	ret = SPI_execute_plan(entry->plan, values, nulls, false, 0);
+	if (ret != SPI_OK_INSERT)
+		elog(ERROR, "pgaudix: audit INSERT failed (SPI returned %d)", ret);
+
 	pfree(values);
-	pfree(types);
 	pfree(nulls);
 }
 
@@ -140,6 +288,7 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc	tupdesc;
+	Oid			relid;
 	const char *audit_table;
 	HeapTuple	rettuple;
 
@@ -221,26 +370,27 @@ pgaudix_trigger(PG_FUNCTION_ARGS)
 	}
 
 	tupdesc = trigdata->tg_relation->rd_att;
+	relid = RelationGetRelid(trigdata->tg_relation);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "pgaudix_trigger: SPI_connect failed");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 	{
-		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_trigtuple, tupdesc,
-						 audit_table);
+		insert_audit_row(AUDIT_OP_INSERT, trigdata->tg_trigtuple, relid,
+						 tupdesc, audit_table);
 		rettuple = trigdata->tg_trigtuple;
 	}
 	else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
 	{
-		insert_audit_row(AUDIT_OP_DELETE, trigdata->tg_trigtuple, tupdesc,
-						 audit_table);
+		insert_audit_row(AUDIT_OP_DELETE, trigdata->tg_trigtuple, relid,
+						 tupdesc, audit_table);
 		rettuple = trigdata->tg_trigtuple;
 	}
 	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
 	{
-		insert_audit_row(AUDIT_OP_UPDATE, trigdata->tg_newtuple, tupdesc,
-						 audit_table);
+		insert_audit_row(AUDIT_OP_UPDATE, trigdata->tg_newtuple, relid,
+						 tupdesc, audit_table);
 		rettuple = trigdata->tg_newtuple;
 	}
 	else
