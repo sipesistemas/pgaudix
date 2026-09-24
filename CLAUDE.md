@@ -33,8 +33,8 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 ## Conventions
 
 - All code, comments, function names, and error messages in **English**
-- Audit metadata columns prefixed with `audit_` (audit_id, audit_operation, audit_timestamp, audit_txid, audit_user, audit_client_addr, audit_app_name, audit_app_user); `audit_app_user` is the last one and defines the attnum offset used by DDL sync
-- `audit_app_user` comes from the `pgaudix.app_user` GUC that the application sets per transaction (`SET LOCAL`)
+- Audit metadata columns prefixed with `audit_` (audit_id, audit_operation, audit_timestamp, audit_txid, audit_user, audit_client_addr, audit_app_name, audit_app_user, audit_app_user_ip); `audit_app_user_ip` is the last one and defines the attnum offset used by DDL sync. The list lives in `pgaudix.reserved_columns()`
+- `audit_app_user` and `audit_app_user_ip` (both `text`) come from the `pgaudix.app_user` / `pgaudix.app_user_ip` GUCs that the application sets per transaction (`SET LOCAL`); NULL when unset
 - Mirrored columns keep their original names
 - Extension schema: `pgaudix`
 - Version: 0.3.0

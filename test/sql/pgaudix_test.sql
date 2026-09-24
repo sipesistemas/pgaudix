@@ -572,8 +572,9 @@ WHERE proname = 'enable' AND pronamespace = 'pgaudix'::regnamespace;
 CREATE TABLE public.test_a4 (id int, v text);
 SELECT pgaudix.enable('public.test_a4');
 
--- Manually drop audit_app_user (the offset column) to force v_offset = NULL on next ddl_sync
-ALTER TABLE public.test_a4_audit DROP COLUMN audit_app_user;
+-- Manually drop audit_app_user_ip (the last metadata column, which defines the
+-- offset) to force v_offset = NULL on next ddl_sync
+ALTER TABLE public.test_a4_audit DROP COLUMN audit_app_user_ip;
 
 DO $$
 BEGIN
@@ -1389,11 +1390,12 @@ SELECT pgaudix.disable('public.test_cpart', drop_data := true);
 DROP TABLE public.test_cpart;
 
 -- ============================================================
--- Test 52: audit_app_user records the application user set via GUC
+-- Test 52: audit_app_user / audit_app_user_ip record what the application sets via GUC
 -- ============================================================
 -- A SaaS connects with one PostgreSQL role, so audit_user cannot identify
--- the end user. The application sets pgaudix.app_user per transaction and
--- the audit row records it; NULL when nothing was set.
+-- the end user and audit_client_addr is the application server. The
+-- application sets pgaudix.app_user and pgaudix.app_user_ip per transaction
+-- and the audit row records them; NULL when nothing was set.
 CREATE TABLE public.test_appuser (id int, v text);
 SELECT pgaudix.enable('public.test_appuser');
 
@@ -1401,6 +1403,7 @@ INSERT INTO public.test_appuser VALUES (1, 'anonymous');
 
 BEGIN;
     SET LOCAL pgaudix.app_user = 'user-4711';
+    SET LOCAL pgaudix.app_user_ip = '203.0.113.7';
     INSERT INTO public.test_appuser VALUES (2, 'by 4711');
     UPDATE public.test_appuser SET v = 'by 4711 again' WHERE id = 2;
 COMMIT;
@@ -1408,7 +1411,14 @@ COMMIT;
 -- SET LOCAL ends with the transaction
 INSERT INTO public.test_appuser VALUES (3, 'anonymous again');
 
-SELECT audit_operation, id, v, audit_app_user, audit_user = session_user AS pg_user_ok
+-- The IP is free text: whatever the application saw (proxy lists included)
+BEGIN;
+    SET LOCAL pgaudix.app_user_ip = '2001:db8::1, 10.0.0.2';
+    DELETE FROM public.test_appuser WHERE id = 1;
+COMMIT;
+
+SELECT audit_operation, id, v, audit_app_user, audit_app_user_ip,
+       audit_user = session_user AS pg_user_ok
 FROM public.test_appuser_audit
 ORDER BY audit_id;
 
@@ -1428,12 +1438,22 @@ WHERE id = 4;
 SELECT pgaudix.disable('public.test_appuser', drop_data := true);
 DROP TABLE public.test_appuser;
 
--- The new metadata name is reserved
+-- The new metadata names are reserved
 CREATE TABLE public.test_appuser_clash (id int, audit_app_user text);
 DO $$
 BEGIN
     PERFORM pgaudix.enable('public.test_appuser_clash');
     RAISE NOTICE 'ERROR: enable should have rejected a source column named audit_app_user';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: reserved name rejected';
+END;
+$$;
+DROP TABLE public.test_appuser_clash;
+CREATE TABLE public.test_appuser_clash (id int, audit_app_user_ip text);
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_appuser_clash');
+    RAISE NOTICE 'ERROR: enable should have rejected a source column named audit_app_user_ip';
 EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: reserved name rejected';
 END;

@@ -64,7 +64,7 @@ CREATE TABLE pgaudix.ddl_guard (
 -- reserved_columns(): the audit metadata column names
 -- ============================================================
 -- Single source of truth for the names a source column may not use. The
--- last one (audit_app_user) defines the attnum offset used by ddl_sync().
+-- last one (audit_app_user_ip) defines the attnum offset used by ddl_sync().
 CREATE FUNCTION pgaudix.reserved_columns()
 RETURNS name[]
 LANGUAGE sql
@@ -74,7 +74,7 @@ SET search_path = pg_catalog, pg_temp
 AS $func$
     SELECT ARRAY['audit_id', 'audit_operation', 'audit_timestamp', 'audit_txid',
                  'audit_user', 'audit_client_addr', 'audit_app_name',
-                 'audit_app_user']::pg_catalog.name[]
+                 'audit_app_user', 'audit_app_user_ip']::pg_catalog.name[]
 $func$;
 
 CREATE FUNCTION pgaudix.heal_registry()
@@ -130,7 +130,7 @@ BEGIN
         IF v_audit_oid IS NULL AND EXISTS (
             SELECT 1 FROM pg_catalog.pg_attribute a
             WHERE a.attrelid = mon.audit_oid
-              AND a.attname = 'audit_app_user' AND NOT a.attisdropped
+              AND a.attname = 'audit_app_user_ip' AND NOT a.attisdropped
         ) THEN
             v_audit_oid := mon.audit_oid;
         END IF;
@@ -573,9 +573,9 @@ BEGIN
     SELECT max(att.attnum) INTO v_max_attnum
     FROM pg_catalog.pg_attribute att
     WHERE att.attrelid = target_table AND att.attnum > 0;
-    IF v_max_attnum IS NOT NULL AND (8 + v_max_attnum) > 1600 THEN
-        RAISE EXCEPTION 'pgaudix: cannot audit %.%: audit table would need % columns (8 metadata + % attnum span), exceeding the 1600-column limit',
-            v_schema, v_table, 8 + v_max_attnum, v_max_attnum;
+    IF v_max_attnum IS NOT NULL AND (9 + v_max_attnum) > 1600 THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: audit table would need % columns (9 metadata + % attnum span), exceeding the 1600-column limit',
+            v_schema, v_table, 9 + v_max_attnum, v_max_attnum;
     END IF;
 
     v_audit := v_table || '_audit';
@@ -658,7 +658,8 @@ BEGIN
         '    audit_user          name NOT NULL DEFAULT session_user,'
         '    audit_client_addr   inet DEFAULT inet_client_addr(),'
         '    audit_app_name      text DEFAULT current_setting(''application_name''),'
-        '    audit_app_user      text DEFAULT current_setting(''pgaudix.app_user'', true)'
+        '    audit_app_user      text DEFAULT current_setting(''pgaudix.app_user'', true),'
+        '    audit_app_user_ip   text DEFAULT current_setting(''pgaudix.app_user_ip'', true)'
         '    %s'
         ')',
         CASE WHEN v_relpersist = 'u' THEN 'UNLOGGED' ELSE '' END,
@@ -1189,15 +1190,15 @@ BEGIN
         END IF;
 
         -- The offset between source and audit attnums is the attnum of the
-        -- last metadata column (audit_app_user)
+        -- last metadata column (audit_app_user_ip)
         SELECT a.attnum INTO v_offset
         FROM pg_catalog.pg_attribute a
         WHERE a.attrelid = v_audit_oid
-          AND a.attname = 'audit_app_user'
+          AND a.attname = 'audit_app_user_ip'
           AND NOT a.attisdropped;
 
         IF v_offset IS NULL THEN
-            RAISE EXCEPTION 'pgaudix: audit table % is corrupted (audit_app_user column missing) — cannot sync DDL',
+            RAISE EXCEPTION 'pgaudix: audit table % is corrupted (audit_app_user_ip column missing) — cannot sync DDL',
                 v_audit_fqn;
         END IF;
 

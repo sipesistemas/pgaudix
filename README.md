@@ -76,22 +76,24 @@ This creates `orders_audit` in the same schema with:
 | `audit_client_addr` | `inet`                   | Client IP address               |
 | `audit_app_name`    | `text`                   | Application name                |
 | `audit_app_user`    | `text`                   | Application user, see below     |
+| `audit_app_user_ip` | `text`                   | Application user's IP, see below |
 | `id`                | `integer`                | *(mirrored from source)*        |
 | `amount`            | `numeric(10,2)`          | *(mirrored from source)*        |
 | `status`            | `text`                   | *(mirrored from source)*        |
 
 ### Identifying the application user
 
-`audit_user` is the PostgreSQL role of the connection. An application that connects with a single role (the usual SaaS setup) records that role on every row, so it also reports the end user through a session variable, once per transaction or request:
+`audit_user` is the PostgreSQL role of the connection and `audit_client_addr` is the address it came from. An application that connects with a single role (the usual SaaS setup) records that role and its own server address on every row, so it also reports the end user, and the end user's address, through session variables, once per transaction or request:
 
 ```sql
 BEGIN;
-SET LOCAL pgaudix.app_user = 'user-4711';   -- or: SELECT set_config('pgaudix.app_user', 'user-4711', true);
+SET LOCAL pgaudix.app_user = 'user-4711';       -- or: SELECT set_config('pgaudix.app_user', 'user-4711', true);
+SET LOCAL pgaudix.app_user_ip = '203.0.113.7';  -- optional
 UPDATE orders SET status = 'shipped' WHERE id = 1;
 COMMIT;
 ```
 
-The audit row stores it in `audit_app_user`; it is NULL when nothing was set. `SET LOCAL` ends with the transaction, so connection pools are safe. The value is whatever the application declares, so trust it as much as you trust the application; `audit_user` remains the authenticated identity.
+The audit row stores them in `audit_app_user` and `audit_app_user_ip`; each is NULL when nothing was set. `SET LOCAL` ends with the transaction, so connection pools are safe. Both are free text: the values are whatever the application declares (the IP may be a proxy list such as `203.0.113.7, 10.0.0.2`), so trust them as much as you trust the application; `audit_user` and `audit_client_addr` remain the authenticated identity and connection address.
 
 ### How operations are recorded
 
@@ -302,7 +304,7 @@ pgaudix/
 
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table; the seven metadata names themselves are rejected
-- The audit table reserves one column slot per source attnum (dropped columns included) plus 8 metadata columns, so the source's highest attnum must be at most 1592 (PostgreSQL limit is 1600)
+- The audit table reserves one column slot per source attnum (dropped columns included) plus 9 metadata columns, so the source's highest attnum must be at most 1591 (PostgreSQL limit is 1600)
 - Dropping a source column drops the mirrored column and its history; dropping a source table drops its audit table (use `disable()` first to keep the data)
 - An UPDATE that moves a row between partitions is recorded as `D` + `I` (PostgreSQL fires no UPDATE trigger for it)
 - `audit_user` is `session_user`; actions performed after `SET ROLE` are attributed to the login role (use `audit_app_user` to identify the acting user)

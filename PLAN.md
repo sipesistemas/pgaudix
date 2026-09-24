@@ -24,6 +24,7 @@ CREATE TABLE public.orders_audit (
     audit_client_addr   inet DEFAULT inet_client_addr(),
     audit_app_name      text DEFAULT current_setting('application_name'),
     audit_app_user      text DEFAULT current_setting('pgaudix.app_user', true),
+    audit_app_user_ip   text DEFAULT current_setting('pgaudix.app_user_ip', true),
     -- Mirrored columns
     id                  int,
     amount              numeric,
@@ -117,7 +118,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 49. A broken registry row does not affect DDL on other tables
 50. The extension's own tables cannot be audited
 51. DDL after the first audited row in the same session (plan cache invalidation, partitions)
-52. audit_app_user records the application user set via the pgaudix.app_user GUC
+52. audit_app_user / audit_app_user_ip record what the application set via the pgaudix.app_user / app_user_ip GUCs
 53. Dropping the source drops its audit table
 54. No dead "enabled" flag in the registry
 55. Scenarios inherited from the retired bug-confirmation script (two ALTERs in one txn, SET SCHEMA, multibyte name, 1600 limit, UNLOGGED)

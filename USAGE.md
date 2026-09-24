@@ -73,10 +73,14 @@ WHERE audit_timestamp >= now() - interval '1 hour';
 SELECT * FROM my_table_audit
 WHERE audit_user = 'app_service';
 
--- Application user, as set by the application with
+-- Application user and its IP, as set by the application with
 --   SET LOCAL pgaudix.app_user = 'user-4711';
+--   SET LOCAL pgaudix.app_user_ip = '203.0.113.7';
 SELECT * FROM my_table_audit
 WHERE audit_app_user = 'user-4711';
+
+SELECT * FROM my_table_audit
+WHERE audit_app_user_ip = '203.0.113.7';
 ```
 
 ## Operations reference
