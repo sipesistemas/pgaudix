@@ -178,7 +178,8 @@ Details worth knowing:
 - **Type changes** are applied to the audit table with an explicit cast (`USING column::newtype`). If the audit history cannot be converted (for example `int` to `uuid`, or narrowing `text` to `varchar(3)` with longer values already logged), the audit column is converted to `text` instead and a `WARNING` is raised: history is preserved and auditing keeps working. An audit column of type `text` is never changed again.
 - **Domains** are mirrored with their base type (`numeric(8,2)` for a domain over it), so `NOT NULL` or `CHECK` constraints of the domain do not reject the NULL data of `T` rows.
 - **Inheritance and partitions**: changes made through a parent table (`ALTER TABLE parent ADD COLUMN`) are synced to audited children and partitions.
-- **Partitioned tables**: every partition gets a `TRUNCATE` trigger so that truncating a partition directly is audited. Partitions attached or detached later, and renames of the root, are reconciled automatically. A `TRUNCATE` statement writes a single `T` row, whether it names the root or one partition.
+- **Partitioned tables**: every partition gets a `TRUNCATE` trigger so that truncating a partition directly is audited. Partitions created, attached or detached later, and renames of the root, are reconciled automatically. Each `TRUNCATE` writes a single `T` row, whether it names the root or one partition, and every `TRUNCATE` is recorded, also when several run inside one function or `DO` block.
+- **Generated columns**: stored generated columns are mirrored with their values. Virtual generated columns (PostgreSQL 18+) have no stored value, so their audit column is always `NULL`; derive the value from the audited columns when needed.
 - **`session_replication_role = replica`**: DML, TRUNCATE and DDL sync keep working (all triggers are `ENABLE ALWAYS`).
 
 ### Check monitored tables
@@ -191,7 +192,7 @@ FROM pgaudix.status();
 --  orders       | orders_audit | t                  | t                   | t
 ```
 
-`status()` returns one row per monitored table with `source_schema`, `source_table`, `audit_schema`, `audit_table`, `created_at`, plus integrity checks: `audit_table_exists`, `dml_trigger_exists`, `dml_trigger_enabled`, `truncate_trigger_exists` and `truncate_trigger_enabled`. A `false` in any of the last five means someone changed the audit objects behind pgaudix's back.
+`status()` returns one row per monitored table with `source_schema`, `source_table`, `audit_schema`, `audit_table`, `created_at`, plus integrity checks: `audit_table_exists`, `dml_trigger_exists`, `dml_trigger_enabled`, `truncate_trigger_exists` and `truncate_trigger_enabled`. A `false` in any of the last five means someone changed the audit objects behind pgaudix's back. `status()` is read-only, so it also works on a hot standby and inside a read-only transaction.
 
 ### Disable auditing
 
@@ -226,7 +227,7 @@ Audit tables are owned by the extension owner. Grant `SELECT` on `<table>_audit`
 
 ### Backup and restore
 
-The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use, so `status()`, `disable()` and DDL sync keep working without manual steps.
+The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use (also when an old OID was reused by an unrelated table in the new cluster), so `status()`, `disable()` and DDL sync keep working without manual steps.
 
 ## Development
 

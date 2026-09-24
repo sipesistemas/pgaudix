@@ -64,7 +64,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - `enable()` serialized with `LOCK TABLE ... IN EXCLUSIVE MODE`
 - `audit_user` uses `session_user` (not `current_user`) for authentic identity
 
-## Test Cases (56 tests + PG18-only virtual generated columns file)
+## Test Cases (61 tests + PG18-only virtual generated columns file)
 
 1. Enable auditing
 2. INSERT audit
@@ -122,3 +122,8 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 54. No dead "enabled" flag in the registry
 55. Scenarios inherited from the retired bug-confirmation script (two ALTERs in one txn, SET SCHEMA, multibyte name, 1600 limit, UNLOGGED)
 56. Reserved metadata names in ADD / RENAME COLUMN give a clear error
+57. heal_registry() does not trust an OID reused by another table (restore collision)
+58. drop_cleanup() only falls back to the name when the OID is stale
+59. Every TRUNCATE is recorded, also inside one DO block (plain and partitioned)
+60. status() works in a read-only transaction with stale OIDs
+61. A partition created after enable() gets its TRUNCATE trigger

@@ -8,8 +8,11 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 
 - **Hybrid C + PL/pgSQL**: C for DML trigger (performance), PL/pgSQL for API and DDL event trigger (maintainability)
 - **Storage model**: Single copy of mirrored columns. One row per operation with current values. Operations: `I` (insert), `U` (update, new values), `D` (delete, old values), `T` (truncate, NULL data).
-- **DDL sync**: Event trigger on `ddl_command_end` compares source `pg_attribute` against audit `pg_attribute` using attnum offset to detect DROP/ADD/RENAME/TYPE CHANGE (in that order, by attnum). Altered tables are expanded to their inheritance children and partitions. Audit table attnums are aligned with source via gap fillers in `enable()`. Uses OID-based lookup for RENAME TABLE support; `heal_registry()` re-resolves OIDs by name after pg_dump/restore. Type changes use an explicit cast and fall back to `text`; domains are mirrored with their base type (`audit_type()`). Per-partition TRUNCATE triggers are reconciled by `sync_partition_triggers()`.
-- **Recursion guard**: `pgaudix.ddl_guard` table (one row per backend pid while `ddl_sync()`/`enable()` run their own DDL). Not a GUC, so it cannot be set by users.
+- **DDL sync**: Event trigger on `ddl_command_end` (tags `ALTER TABLE`, `ALTER SCHEMA`, `CREATE TABLE`) compares source `pg_attribute` against audit `pg_attribute` using attnum offset to detect DROP/ADD/RENAME/TYPE CHANGE (in that order, by attnum). Altered tables are expanded to their inheritance children and partitions. Audit table attnums are aligned with source via gap fillers in `enable()`. Virtual generated columns (PG18+) are mirrored as live, always-NULL columns so the alignment survives pg_dump/restore (dropped slots are not dumped). Uses OID-based lookup for RENAME TABLE support; `heal_registry()` re-resolves OIDs by name after pg_dump/restore, treating an OID whose current name differs from the registered one as stale (OID reuse). `ddl_sync()`, the pre-pass and `disable()` never act on a registered OID whose relation does not carry `pgaudix_audit_trigger`. Type changes use an explicit cast and fall back to `text`; domains are mirrored with their base type (`audit_type()`). Per-partition TRUNCATE triggers are reconciled by `sync_partition_triggers()`, only when the command touched a monitored partition tree.
+- **TRUNCATE**: the root's statement trigger writes one `T` row and records in `pgaudix.truncate_pending` (pid, audit table, txid, count) how many leaf triggers of the same statement follow; those consume the count instead of writing. A direct TRUNCATE of a leaf, or a second TRUNCATE in the same transaction, finds no pending count and is recorded.
+- **status()** is a read-only SQL function (resolves stale OIDs by name without writing) so it works on a hot standby.
+- **Recursion guard**: `pgaudix.ddl_guard` table (one row per backend pid while `ddl_sync()`/`enable()` run their own DDL). Not a GUC, so it cannot be set by users. `drop_cleanup()` also returns early while the guard is held (the DROP TRIGGER / DROP COLUMN issued by our own DDL).
+- **C plan cache**: one saved SPI plan per source relation, invalidated by a relcache callback; stale entries (including dropped partitions) are freed on the next trigger call unless the plan is executing (`in_use`).
 - **Security**: All functions are SECURITY DEFINER with `SET search_path = pgaudix, pg_catalog, pg_temp` and `REVOKE EXECUTE FROM PUBLIC`; `enable()`/`disable()` check table ownership via `pgaudix.invoker()` (the `role` GUC, else `session_user`). C trigger validates tgargs format. Audit tables are write-protected (REVOKE from PUBLIC). Concurrent enable() calls are serialized. Event and DML triggers are ENABLE ALWAYS.
 
 ## Key Files
@@ -25,7 +28,7 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 - `pgaudix.enable(target_table regclass)` — Start auditing a table (creates `_audit` table + trigger)
 - `pgaudix.disable(target_table regclass, drop_data bool DEFAULT false)` — Stop auditing
 - `pgaudix.status()` — List all monitored tables with integrity flags
-- Internal helpers (not for users): `heal_registry()`, `sync_partition_triggers()`, `audit_type()`, `check_table_owner()`, `invoker()`
+- Internal helpers (not for users): `heal_registry()`, `sync_partition_triggers()`, `audit_type()`, `check_table_owner()`, `invoker()`, `reserved_columns()` (single list of the metadata column names used by `enable()` and `ddl_sync()`)
 
 ## Conventions
 
