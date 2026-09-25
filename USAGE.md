@@ -3,7 +3,16 @@
 ## Install
 
 ```sql
-CREATE EXTENSION pgaudix;
+CREATE EXTENSION pgaudix;   -- as a superuser
+```
+
+To let a non-superuser role manage auditing of its own tables:
+
+```sql
+GRANT USAGE ON SCHEMA pgaudix TO app_admin;
+GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass),
+                          pgaudix.disable(regclass, boolean),
+                          pgaudix.status() TO app_admin;
 ```
 
 ## Enable auditing
@@ -26,6 +35,9 @@ SELECT pgaudix.disable('my_table', drop_data := true);
 
 ```sql
 SELECT * FROM pgaudix.status();
+-- source_schema, source_table, audit_schema, audit_table, created_at,
+-- audit_table_exists, dml_trigger_exists, dml_trigger_enabled,
+-- truncate_trigger_exists, truncate_trigger_enabled
 ```
 
 ## Query audit data
@@ -57,8 +69,18 @@ WHERE audit_timestamp >= now() - interval '1 hour';
 ### Filter by user
 
 ```sql
+-- PostgreSQL role of the connection
 SELECT * FROM my_table_audit
 WHERE audit_user = 'app_service';
+
+-- Application user and its IP, as set by the application with
+--   SET LOCAL pgaudix.app_user = 'user-4711';
+--   SET LOCAL pgaudix.app_user_ip = '203.0.113.7';
+SELECT * FROM my_table_audit
+WHERE audit_app_user = 'user-4711';
+
+SELECT * FROM my_table_audit
+WHERE audit_app_user_ip = '203.0.113.7';
 ```
 
 ## Operations reference
