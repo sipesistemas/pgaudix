@@ -30,8 +30,10 @@ PG_FUNCTION_INFO_V1(pgaudix_trigger);
  * callback therefore marks the entry stale; it is rebuilt on next use. Stale
  * plans are freed on the next trigger call, not inside the callback (which
  * may run during abort processing) and never while the plan is executing
- * (in_use, for a nested audit trigger fired from within the audit INSERT).
- * Entries of relations that were dropped are swept the same way, so a
+ * (in_use, for a nested audit trigger fired from within the audit INSERT;
+ * such a nested call that finds its entry stale prepares a private,
+ * uncached plan instead). Entries of relations that were dropped are swept
+ * the same way, so a
  * long-lived connection that churns through partitions does not accumulate
  * plans. Changes to the audit table itself are tracked by PostgreSQL's own
  * plan cache, which replans the saved statement.
@@ -162,10 +164,12 @@ _PG_init(void)
  * typed with the source column's type.
  */
 static AuditPlanEntry *
-get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
+get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table,
+			   AuditPlanEntry *private_entry)
 {
 	AuditPlanEntry *entry;
 	bool		found;
+	bool		keep = true;
 	StringInfoData cols;
 	StringInfoData vals;
 	StringInfoData query;
@@ -197,16 +201,26 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 	/*
 	 * Stale or new: drop the old plan (outside the invalidation callback).
 	 * A stale plan that is still executing (this trigger fired from inside
-	 * its own audit INSERT) cannot be replaced in place.
+	 * its own audit INSERT, and the relcache invalidation arrived in
+	 * between) cannot be replaced in place: leave it for the sweep once its
+	 * caller returns, and prepare a private plan for this call only. It
+	 * lives in the current SPI context and goes away with SPI_finish().
 	 */
 	if (entry->in_use > 0)
-		elog(ERROR, "pgaudix: audit plan for relation %u is stale while in use",
-			 relid);
-	entry->valid = false;
-	if (entry->plan != NULL)
 	{
-		SPI_freeplan(entry->plan);
-		entry->plan = NULL;
+		entry = private_entry;
+		memset(entry, 0, sizeof(AuditPlanEntry));
+		entry->relid = relid;
+		keep = false;
+	}
+	else
+	{
+		entry->valid = false;
+		if (entry->plan != NULL)
+		{
+			SPI_freeplan(entry->plan);
+			entry->plan = NULL;
+		}
 	}
 
 	/* Count audited columns */
@@ -247,7 +261,7 @@ get_audit_plan(Oid relid, TupleDesc tupdesc, const char *audit_table)
 	if (entry->plan == NULL)
 		elog(ERROR, "pgaudix: SPI_prepare failed: %s",
 			 SPI_result_code_string(SPI_result));
-	if (SPI_keepplan(entry->plan) != 0)
+	if (keep && SPI_keepplan(entry->plan) != 0)
 		elog(ERROR, "pgaudix: SPI_keepplan failed");
 
 	entry->nparams = nparams;
@@ -275,6 +289,7 @@ insert_audit_row(const char *operation, HeapTuple tuple, Oid relid,
 				 TupleDesc tupdesc, const char *audit_table)
 {
 	AuditPlanEntry *entry;
+	AuditPlanEntry private_entry;
 	int			natts = tupdesc->natts;
 	Datum	   *values;
 	char	   *nulls;
@@ -282,7 +297,7 @@ insert_audit_row(const char *operation, HeapTuple tuple, Oid relid,
 	int			i;
 	int			ret;
 
-	entry = get_audit_plan(relid, tupdesc, audit_table);
+	entry = get_audit_plan(relid, tupdesc, audit_table, &private_entry);
 
 	/* palloc never returns NULL — it ereports on OOM */
 	values = (Datum *) palloc(entry->nparams * sizeof(Datum));

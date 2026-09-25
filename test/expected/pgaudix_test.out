@@ -1900,11 +1900,11 @@ ORDER BY audit_id;
 -- The broken tables report their own problem only when they are altered
 ALTER TABLE public.test_broken ADD COLUMN y int;
 ERROR:  pgaudix: audit table public.test_broken_audit is missing — cannot sync DDL
-CONTEXT:  PL/pgSQL function ddl_sync() line 283 at RAISE
+CONTEXT:  PL/pgSQL function ddl_sync() line 287 at RAISE
 ALTER TABLE public.test_conflict2 ADD COLUMN y int;
 ERROR:  relation "test_conflict2_audit" already exists
 CONTEXT:  SQL statement "ALTER TABLE public.test_conflict_audit RENAME TO test_conflict2_audit"
-PL/pgSQL function ddl_sync() line 159 at EXECUTE
+PL/pgSQL function ddl_sync() line 163 at EXECUTE
 -- Cleanup
 SELECT pgaudix.disable('public.test_unrelated', drop_data := true);
  disable 
@@ -2087,6 +2087,24 @@ ORDER BY audit_id;
  U               |  2 | by 4711 again   | user-4711      | 203.0.113.7           | t
  I               |  3 | anonymous again |                |                       | t
  D               |  1 | anonymous       |                | 2001:db8::1, 10.0.0.2 | t
+(5 rows)
+
+-- psql prints NULL and '' the same way: once a session has run SET LOCAL on
+-- a custom GUC, current_setting(..., true) returns '' instead of NULL for
+-- the rest of the session, so an unattributed row must still be NULL (not
+-- an empty string) or `WHERE audit_app_user IS NULL` misses it (pooled
+-- connections reuse backends across requests).
+SELECT id, audit_app_user IS NULL AS user_is_null,
+       audit_app_user_ip IS NULL AS ip_is_null
+FROM public.test_appuser_audit
+ORDER BY audit_id;
+ id | user_is_null | ip_is_null 
+----+--------------+------------
+  1 | t            | t
+  2 | f            | f
+  2 | f            | f
+  3 | t            | t
+  1 | t            | f
 (5 rows)
 
 -- Metadata columns come first, then mirrored columns; DDL sync still aligns
@@ -2745,6 +2763,439 @@ SELECT pgaudix.disable('public.test_newpart', drop_data := true);
 (1 row)
 
 DROP TABLE public.test_newpart;
+-- ============================================================
+-- Test 62: heal_registry() survives OIDs swapped between monitored tables
+-- ============================================================
+-- After a restore two monitored tables can hold each other's old OID (OID
+-- reuse). Healing row by row under the UNIQUE on source_oid raised a
+-- duplicate-key error and left the extension unusable in the database
+-- (every enable()/disable()/DDL calls heal_registry()).
+CREATE TABLE public.test_swap_a (id int);
+CREATE TABLE public.test_swap_b (id int);
+SELECT pgaudix.enable('public.test_swap_a');
+ enable 
+--------
+ 
+(1 row)
+
+SELECT pgaudix.enable('public.test_swap_b');
+ enable 
+--------
+ 
+(1 row)
+
+-- (a restored registry holds the old OIDs, which never collide with each
+-- other; the simulation releases them first because of the UNIQUE)
+UPDATE pgaudix.monitored_tables
+SET source_oid = NULL
+WHERE source_table IN ('test_swap_a', 'test_swap_b');
+UPDATE pgaudix.monitored_tables
+SET source_oid = CASE source_table
+                     WHEN 'test_swap_a' THEN 'public.test_swap_b'::regclass
+                     ELSE 'public.test_swap_a'::regclass
+                 END
+WHERE source_table IN ('test_swap_a', 'test_swap_b');
+ALTER TABLE public.test_swap_a ADD COLUMN x int;
+SELECT source_table,
+       source_oid = ('public.' || source_table)::regclass AS source_healed
+FROM pgaudix.monitored_tables
+WHERE source_table IN ('test_swap_a', 'test_swap_b')
+ORDER BY source_table;
+ source_table | source_healed 
+--------------+---------------
+ test_swap_a  | t
+ test_swap_b  | t
+(2 rows)
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_swap_a_audit'
+  AND column_name NOT LIKE 'audit\_%'
+ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ x
+(2 rows)
+
+-- The extension is still usable afterwards
+CREATE TABLE public.test_swap_c (id int);
+SELECT pgaudix.enable('public.test_swap_c');
+ enable 
+--------
+ 
+(1 row)
+
+INSERT INTO public.test_swap_a VALUES (1, 10);
+INSERT INTO public.test_swap_b VALUES (2);
+SELECT 'a' AS t, audit_operation, id FROM public.test_swap_a_audit
+UNION ALL
+SELECT 'b', audit_operation, id FROM public.test_swap_b_audit
+ORDER BY 1;
+ t | audit_operation | id 
+---+-----------------+----
+ a | I               |  1
+ b | I               |  2
+(2 rows)
+
+-- One-directional reuse: the registered OID of a source that was not
+-- restored now belongs to another monitored table. That row is an orphan
+-- (no table carries its name) and must not borrow the other table's OID:
+-- DDL on the live table used to fail trying to rename the orphan's audit
+-- table over the live audit table.
+ALTER EVENT TRIGGER pgaudix_drop_cleanup DISABLE;
+DROP TABLE public.test_swap_c;
+ALTER EVENT TRIGGER pgaudix_drop_cleanup ENABLE ALWAYS;
+-- (b's own row holds its pre-restore OID, which no longer exists)
+UPDATE pgaudix.monitored_tables
+SET source_oid = 4294967295
+WHERE source_table = 'test_swap_b';
+UPDATE pgaudix.monitored_tables
+SET source_oid = 'public.test_swap_b'::regclass
+WHERE source_table = 'test_swap_c';
+ALTER TABLE public.test_swap_b ADD COLUMN y int;
+SELECT source_table, audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table LIKE 'test\_swap\_%'
+ORDER BY source_table;
+ source_table | audit_table_exists | dml_trigger_exists 
+--------------+--------------------+--------------------
+ test_swap_a  | t                  | t
+ test_swap_b  | t                  | t
+ test_swap_c  | t                  | f
+(3 rows)
+
+SELECT source_table, source_oid IS NULL AS source_unknown
+FROM pgaudix.monitored_tables
+WHERE source_table = 'test_swap_c';
+ source_table | source_unknown 
+--------------+----------------
+ test_swap_c  | t
+(1 row)
+
+INSERT INTO public.test_swap_b VALUES (3, 30);
+SELECT audit_operation, id, y FROM public.test_swap_b_audit ORDER BY audit_id;
+ audit_operation | id | y  
+-----------------+----+----
+ I               |  2 |   
+ I               |  3 | 30
+(2 rows)
+
+-- A new table with the orphan's name is not registered over it (its audit
+-- table may still hold history); disable() removes the orphan first
+CREATE TABLE public.test_swap_c (id int);
+DO $$
+BEGIN
+    PERFORM pgaudix.enable('public.test_swap_c');
+    RAISE NOTICE 'ERROR: enable should have reported the orphan registration';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+NOTICE:  OK: pgaudix: a stale registration of public.test_swap_c exists (its source table was not found); run pgaudix.disable('public.test_swap_c') first
+SELECT pgaudix.disable('public.test_swap_c', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+SELECT to_regclass('public.test_swap_c_audit') IS NULL AS orphan_audit_dropped,
+       (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_swap_c') AS registry_rows;
+ orphan_audit_dropped | registry_rows 
+----------------------+---------------
+ t                    |             0
+(1 row)
+
+SELECT pgaudix.enable('public.test_swap_c');
+ enable 
+--------
+ 
+(1 row)
+
+INSERT INTO public.test_swap_c VALUES (1);
+SELECT audit_operation, id FROM public.test_swap_c_audit;
+ audit_operation | id 
+-----------------+----
+ I               |  1
+(1 row)
+
+SELECT pgaudix.disable('public.test_swap_a', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+SELECT pgaudix.disable('public.test_swap_b', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+SELECT pgaudix.disable('public.test_swap_c', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+DROP TABLE public.test_swap_a, public.test_swap_b, public.test_swap_c;
+-- ============================================================
+-- Test 63: heal_registry() must not bind a source to another table's audit log
+-- ============================================================
+-- When the registered audit name no longer resolves, a stored audit OID that
+-- still exists was kept as long as the relation looked like an audit table.
+-- Every audit table looks like one, so an OID reused by another monitored
+-- table's audit table captured that table's log: the next DDL renamed it.
+CREATE TABLE public.test_bind_c (id int);
+CREATE TABLE public.test_bind_d (id int);
+SELECT pgaudix.enable('public.test_bind_c');
+ enable 
+--------
+ 
+(1 row)
+
+SELECT pgaudix.enable('public.test_bind_d');
+ enable 
+--------
+ 
+(1 row)
+
+INSERT INTO public.test_bind_d VALUES (1);
+DROP TABLE public.test_bind_c_audit;
+UPDATE pgaudix.monitored_tables
+SET audit_oid = 'public.test_bind_d_audit'::regclass
+WHERE source_table = 'test_bind_c';
+DO $$
+BEGIN
+    ALTER TABLE public.test_bind_c ADD COLUMN z int;
+    RAISE NOTICE 'ERROR: DDL on a source without audit table should fail';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+NOTICE:  OK: pgaudix: audit table public.test_bind_c_audit is missing — cannot sync DDL
+SELECT to_regclass('public.test_bind_d_audit') IS NOT NULL AS d_audit_intact,
+       to_regclass('public.test_bind_c_audit') IS NULL     AS c_audit_still_gone;
+ d_audit_intact | c_audit_still_gone 
+----------------+--------------------
+ t              | t
+(1 row)
+
+INSERT INTO public.test_bind_d VALUES (2);
+SELECT audit_operation, id FROM public.test_bind_d_audit ORDER BY audit_id;
+ audit_operation | id 
+-----------------+----
+ I               |  1
+ I               |  2
+(2 rows)
+
+SELECT source_table, audit_table_exists
+FROM pgaudix.status()
+WHERE source_table LIKE 'test\_bind\_%'
+ORDER BY source_table;
+ source_table | audit_table_exists 
+--------------+--------------------
+ test_bind_c  | f
+ test_bind_d  | t
+(2 rows)
+
+SELECT pgaudix.disable('public.test_bind_c');
+ disable 
+---------
+ 
+(1 row)
+
+SELECT pgaudix.disable('public.test_bind_d', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+DROP TABLE public.test_bind_c, public.test_bind_d;
+-- ============================================================
+-- Test 64: RENAME TABLE to a name whose audit name would overflow NAMEDATALEN
+-- ============================================================
+-- enable() rejects such names, but the DDL-sync pre-pass built the new audit
+-- name in a `name` variable and let PostgreSQL truncate it silently.
+CREATE TABLE public.test_ren_short (id int);
+SELECT pgaudix.enable('public.test_ren_short');
+ enable 
+--------
+ 
+(1 row)
+
+INSERT INTO public.test_ren_short VALUES (1);
+DO $$
+BEGIN
+    ALTER TABLE public.test_ren_short
+        RENAME TO renamed_to_a_name_so_long_that_its_audit_name_overflows_63;
+    RAISE NOTICE 'ERROR: rename to an overlong name should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: rename rejected: %', SQLERRM;
+END;
+$$;
+NOTICE:  OK: rename rejected: pgaudix: source table name renamed_to_a_name_so_long_that_its_audit_name_overflows_63 is too long (audit table name would exceed 63 bytes)
+-- Nothing changed: source keeps its name, audit table and trigger intact
+SELECT source_table, audit_table, audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table LIKE 'test\_ren\_%' OR source_table LIKE 'renamed\_%';
+  source_table  |     audit_table      | audit_table_exists | dml_trigger_exists 
+----------------+----------------------+--------------------+--------------------
+ test_ren_short | test_ren_short_audit | t                  | t
+(1 row)
+
+INSERT INTO public.test_ren_short VALUES (2);
+SELECT audit_operation, id FROM public.test_ren_short_audit ORDER BY audit_id;
+ audit_operation | id 
+-----------------+----
+ I               |  1
+ I               |  2
+(2 rows)
+
+-- A rename that still fits works as before (57 bytes + '_audit' = 63)
+ALTER TABLE public.test_ren_short
+    RENAME TO renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes_;
+NOTICE:  pgaudix: synchronized audit registration to public.renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes__audit
+SELECT source_table, audit_table
+FROM pgaudix.status()
+WHERE source_table LIKE 'renamed\_%';
+                       source_table                        |                           audit_table                           
+-----------------------------------------------------------+-----------------------------------------------------------------
+ renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes_ | renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes__audit
+(1 row)
+
+SELECT pgaudix.disable('public.renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes_',
+                       drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+DROP TABLE public.renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes_;
+-- ============================================================
+-- Test 65: a partition trigger that will not fire is not counted
+-- ============================================================
+-- The root's TRUNCATE trigger counts the descendants' triggers that will
+-- follow in the statement. One in state 'R' (ENABLE REPLICA) under the
+-- default replication role does not fire, so the count never reached zero
+-- and a later TRUNCATE of a sibling in the same transaction consumed the
+-- leftover instead of being recorded. sync_partition_triggers() resets the
+-- state on any DDL of the tree, so the state is forced through the catalog.
+CREATE TABLE public.test_tgstate (id int) PARTITION BY RANGE (id);
+CREATE TABLE public.test_tgstate_p1 PARTITION OF public.test_tgstate FOR VALUES FROM (0) TO (10);
+CREATE TABLE public.test_tgstate_p2 PARTITION OF public.test_tgstate FOR VALUES FROM (10) TO (20);
+SELECT pgaudix.enable('public.test_tgstate');
+ enable 
+--------
+ 
+(1 row)
+
+UPDATE pg_catalog.pg_trigger SET tgenabled = 'R'
+WHERE tgrelid = 'public.test_tgstate_p1'::regclass AND tgname = 'pgaudix_truncate_trigger';
+BEGIN;
+    TRUNCATE public.test_tgstate;
+    TRUNCATE public.test_tgstate_p2;
+COMMIT;
+SELECT audit_operation, count(*)
+FROM public.test_tgstate_audit
+GROUP BY audit_operation;
+ audit_operation | count 
+-----------------+-------
+ T               |     2
+(1 row)
+
+SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
+ pending_rows 
+--------------
+            0
+(1 row)
+
+-- Under replica role only 'A' and 'R' triggers fire
+UPDATE pg_catalog.pg_trigger SET tgenabled = 'O'
+WHERE tgrelid = 'public.test_tgstate_p1'::regclass AND tgname = 'pgaudix_truncate_trigger';
+SET session_replication_role = replica;
+BEGIN;
+    TRUNCATE public.test_tgstate;
+    TRUNCATE public.test_tgstate_p2;
+COMMIT;
+RESET session_replication_role;
+SELECT audit_operation, count(*)
+FROM public.test_tgstate_audit
+GROUP BY audit_operation;
+ audit_operation | count 
+-----------------+-------
+ T               |     4
+(1 row)
+
+SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
+ pending_rows 
+--------------
+            0
+(1 row)
+
+SELECT pgaudix.disable('public.test_tgstate', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+DROP TABLE public.test_tgstate;
+-- ============================================================
+-- Test 66: a nested audit trigger survives a plan invalidated mid-execution
+-- ============================================================
+-- A user trigger on the audit table writes back to the source while the
+-- source's cached audit plan is executing. If a relcache invalidation for
+-- the source arrives in between (ANALYZE here; VACUUM or a concurrent DDL
+-- in general), the nested trigger call found the entry stale and in use and
+-- aborted the outer DML instead of preparing a private plan.
+CREATE TABLE public.test_nested (id int, v text);
+SELECT pgaudix.enable('public.test_nested');
+ enable 
+--------
+ 
+(1 row)
+
+CREATE FUNCTION public.test_nested_fn() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.v = 'outer' THEN
+        ANALYZE public.test_nested;
+        INSERT INTO public.test_nested VALUES (NEW.id + 100, 'inner');
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER test_nested_tg AFTER INSERT ON public.test_nested_audit
+    FOR EACH ROW EXECUTE FUNCTION public.test_nested_fn();
+INSERT INTO public.test_nested VALUES (1, 'outer');
+SELECT audit_operation, id, v FROM public.test_nested_audit ORDER BY audit_id;
+ audit_operation | id  |   v   
+-----------------+-----+-------
+ I               |   1 | outer
+ I               | 101 | inner
+(2 rows)
+
+-- The rebuilt cached plan keeps working afterwards, also after DDL
+INSERT INTO public.test_nested VALUES (2, 'plain');
+ALTER TABLE public.test_nested ADD COLUMN w int;
+INSERT INTO public.test_nested VALUES (3, 'outer', 30);
+SELECT audit_operation, id, v, w FROM public.test_nested_audit ORDER BY audit_id;
+ audit_operation | id  |   v   | w  
+-----------------+-----+-------+----
+ I               |   1 | outer |   
+ I               | 101 | inner |   
+ I               |   2 | plain |   
+ I               |   3 | outer | 30
+ I               | 103 | inner |   
+(5 rows)
+
+SELECT pgaudix.disable('public.test_nested', drop_data := true);
+ disable 
+---------
+ 
+(1 row)
+
+DROP TABLE public.test_nested;
+DROP FUNCTION public.test_nested_fn();
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (
     id      serial PRIMARY KEY,

@@ -23,8 +23,8 @@ CREATE TABLE public.orders_audit (
     audit_user          name NOT NULL DEFAULT session_user,
     audit_client_addr   inet DEFAULT inet_client_addr(),
     audit_app_name      text DEFAULT current_setting('application_name'),
-    audit_app_user      text DEFAULT current_setting('pgaudix.app_user', true),
-    audit_app_user_ip   text DEFAULT current_setting('pgaudix.app_user_ip', true),
+    audit_app_user      text DEFAULT nullif(current_setting('pgaudix.app_user', true), ''),
+    audit_app_user_ip   text DEFAULT nullif(current_setting('pgaudix.app_user_ip', true), ''),
     -- Mirrored columns
     id                  int,
     amount              numeric,
@@ -55,7 +55,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - `pgaudix.truncate_trigger()` — PL/pgSQL AFTER TRUNCATE trigger (statement-level)
 - `pgaudix.ddl_sync()` — event trigger for ALTER TABLE / ALTER SCHEMA: detects DROP/ADD/RENAME/TYPE CHANGE columns (attnum order) on the altered tables and their descendants. On RENAME TABLE / SET SCHEMA, renames the audit table and recreates triggers. Warns on direct ALTER of audit tables. Recursion guard: `pgaudix.ddl_guard` table.
 - `pgaudix.drop_cleanup()` — sql_drop event trigger removing registry rows of dropped sources
-- Helpers: `heal_registry()` (OIDs after restore), `sync_partition_triggers()` (per-leaf TRUNCATE triggers), `audit_type()` (domain base types), `check_table_owner()` / `invoker()` (privilege checks)
+- Helpers: `heal_registry()` (OIDs after restore), `sync_partition_triggers()` (per-leaf TRUNCATE triggers), `audit_type()` (domain base types), `audit_name()` (audit table name, length check), `reserved_columns()`, `check_table_owner()` / `invoker()` (privilege checks)
 
 ### Security
 - All SECURITY DEFINER functions use `SET search_path = pgaudix, pg_catalog, pg_temp`
@@ -65,7 +65,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - `enable()` serialized with `LOCK TABLE ... IN EXCLUSIVE MODE`
 - `audit_user` uses `session_user` (not `current_user`) for authentic identity
 
-## Test Cases (61 tests + PG18-only virtual generated columns file)
+## Test Cases (66 tests + PG18-only virtual generated columns file)
 
 1. Enable auditing
 2. INSERT audit
@@ -118,7 +118,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 49. A broken registry row does not affect DDL on other tables
 50. The extension's own tables cannot be audited
 51. DDL after the first audited row in the same session (plan cache invalidation, partitions)
-52. audit_app_user / audit_app_user_ip record what the application set via the pgaudix.app_user / app_user_ip GUCs
+52. audit_app_user / audit_app_user_ip record what the application set via the pgaudix.app_user / app_user_ip GUCs (NULL, not '', when unset)
 53. Dropping the source drops its audit table
 54. No dead "enabled" flag in the registry
 55. Scenarios inherited from the retired bug-confirmation script (two ALTERs in one txn, SET SCHEMA, multibyte name, 1600 limit, UNLOGGED)
@@ -128,3 +128,8 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 59. Every TRUNCATE is recorded, also inside one DO block (plain and partitioned)
 60. status() works in a read-only transaction with stale OIDs
 61. A partition created after enable() gets its TRUNCATE trigger
+62. heal_registry() survives OIDs swapped between monitored tables; orphan rows
+63. heal_registry() never binds a source to another table's audit log
+64. RENAME TABLE to a name whose audit name would overflow NAMEDATALEN is rejected
+65. Partition triggers that will not fire under the replication role are not counted
+66. A nested audit trigger survives a plan invalidated mid-execution

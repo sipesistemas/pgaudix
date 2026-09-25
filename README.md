@@ -93,7 +93,7 @@ UPDATE orders SET status = 'shipped' WHERE id = 1;
 COMMIT;
 ```
 
-The audit row stores them in `audit_app_user` and `audit_app_user_ip`; each is NULL when nothing was set. `SET LOCAL` ends with the transaction, so connection pools are safe. Both are free text: the values are whatever the application declares (the IP may be a proxy list such as `203.0.113.7, 10.0.0.2`), so trust them as much as you trust the application; `audit_user` and `audit_client_addr` remain the authenticated identity and connection address.
+The audit row stores them in `audit_app_user` and `audit_app_user_ip`; each is NULL when nothing was set (an empty string counts as unset, since PostgreSQL reports a custom setting as `''` once the session has ever set it). `SET LOCAL` ends with the transaction, so connection pools are safe. Both are free text: the values are whatever the application declares (the IP may be a proxy list such as `203.0.113.7, 10.0.0.2`), so trust them as much as you trust the application; `audit_user` and `audit_client_addr` remain the authenticated identity and connection address.
 
 ### How operations are recorded
 
@@ -229,7 +229,7 @@ Audit tables are owned by the extension owner. Grant `SELECT` on `<table>_audit`
 
 ### Backup and restore
 
-The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use (also when an old OID was reused by an unrelated table in the new cluster), so `status()`, `disable()` and DDL sync keep working without manual steps.
+The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use (also when an old OID was reused by an unrelated table in the new cluster), so `status()`, `disable()` and DDL sync keep working without manual steps. A registration whose source table was not restored is kept as an orphan (`status()` shows it without a DML trigger); `pgaudix.disable('schema.table', drop_data := true)` removes it, and is required before a new table of that name can be enabled.
 
 ## Development
 
@@ -303,7 +303,7 @@ pgaudix/
 ## Known Limitations
 
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
-- Source columns starting with `audit_` will work but may cause confusion when reading the audit table; the seven metadata names themselves are rejected
+- Source columns starting with `audit_` will work but may cause confusion when reading the audit table; the nine metadata names themselves (see `pgaudix.reserved_columns()`) are rejected
 - The audit table reserves one column slot per source attnum (dropped columns included) plus 9 metadata columns, so the source's highest attnum must be at most 1591 (PostgreSQL limit is 1600)
 - Dropping a source column drops the mirrored column and its history; dropping a source table drops its audit table (use `disable()` first to keep the data)
 - An UPDATE that moves a row between partitions is recorded as `D` + `I` (PostgreSQL fires no UPDATE trigger for it)
