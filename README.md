@@ -229,7 +229,7 @@ Audit tables are owned by the extension owner. Grant `SELECT` on `<table>_audit`
 
 ### Backup and restore
 
-The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use (also when an old OID was reused by an unrelated table in the new cluster), so `status()`, `disable()` and DDL sync keep working without manual steps. A registration whose source table was not restored is kept as an orphan (`status()` shows it without a DML trigger); `pgaudix.disable('schema.table', drop_data := true)` removes it, and is required before a new table of that name can be enabled.
+The registry is dumped by `pg_dump` together with the audit tables and triggers. After a restore, pgaudix re-resolves the tables by name on first use (also when an old OID was reused by an unrelated table in the new cluster), so `status()`, `disable()` and DDL sync keep working without manual steps. A registration whose source table was not restored is kept as an orphan (`status()` shows it without a DML trigger); `pgaudix.disable('schema.table', drop_data := true)` removes it, and is required before a new table of that name can be enabled or a monitored table renamed to it. Its audit table is never removed on its own: dropping an unrelated table that carries the orphan's name leaves it alone, because only a table that carries the pgaudix DML trigger for that audit table is treated as its source. For the same reason a source that lost its trigger (a restore without the extension's shared library) and is then dropped leaves its registration and audit table behind for `disable()`.
 
 ## Development
 
@@ -298,7 +298,7 @@ pgaudix/
 - The `audit_user` column captures `session_user` (the authenticated identity) rather than `current_user`, so it cannot be spoofed via `SET ROLE`
 - Concurrent `enable()` calls are serialized with an explicit lock to prevent race conditions
 - The `enable()` function rejects duplicate registrations
-- Direct `ALTER TABLE` on audit tables produces a warning
+- Direct `ALTER TABLE` on audit tables produces a warning. A column added and dropped, or a mirrored column dropped, directly on the audit table leaves a dropped slot that a later source column cannot take (attnums are never recycled); the `ALTER TABLE` that adds such a column is refused with a message explaining how to rebuild the audit table (rename it to keep its history, then `disable()` and `enable()` again)
 
 ## Known Limitations
 

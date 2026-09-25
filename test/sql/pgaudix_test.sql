@@ -1683,10 +1683,18 @@ DROP TABLE public.test_heal_other;
 SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
        (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
 
--- Dropping the real source (by name, stale OID) cleans up as usual
+-- Dropping the real source now that nothing ties it to the registration
+-- (no trigger, no OID) keeps the registration and its audit table: it looks
+-- exactly like an unrelated table carrying a stale registration's name
+-- (test 68), and the audit table may hold history. disable() removes them.
 DROP TABLE public.test_heal_src;
 SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
        (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
+CREATE TABLE public.test_heal_src (id int);
+SELECT pgaudix.disable('public.test_heal_src', drop_data := true);
+SELECT to_regclass('public.test_heal_src_audit') IS NOT NULL AS audit_exists,
+       (SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table = 'test_heal_src') AS registry_rows;
+DROP TABLE public.test_heal_src;
 DROP TABLE IF EXISTS public.test_heal_other_audit;
 
 -- ============================================================
@@ -2100,6 +2108,165 @@ SELECT audit_operation, id, v, w FROM public.test_nested_audit ORDER BY audit_id
 SELECT pgaudix.disable('public.test_nested', drop_data := true);
 DROP TABLE public.test_nested;
 DROP FUNCTION public.test_nested_fn();
+
+-- ============================================================
+-- Test 67: a dropped slot in the audit table must not swallow a new column
+-- ============================================================
+-- ADD-column detection treated a DROPPED audit attribute at the source
+-- column's slot as "already mirrored": the new source column was never added
+-- and every DML on the source failed (column missing in the audit table).
+-- A dropped slot cannot be reused (attnums are never recycled), so the DDL
+-- is refused with a message that says how to rebuild the audit table, and
+-- the source keeps being audited as it was.
+CREATE TABLE public.test_slot (id int, a int);
+SELECT pgaudix.enable('public.test_slot');
+INSERT INTO public.test_slot VALUES (1, 10);
+
+-- A column added and dropped directly on the audit table (only a WARNING)
+-- leaves a dropped attribute exactly where the next source column would land
+ALTER TABLE public.test_slot_audit ADD COLUMN junk int;
+ALTER TABLE public.test_slot_audit DROP COLUMN junk;
+
+DO $$
+BEGIN
+    ALTER TABLE public.test_slot ADD COLUMN b int;
+    RAISE NOTICE 'ERROR: the ALTER should have been refused (audit table out of alignment)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+
+-- The source is unchanged and still audited
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'test_slot'
+ORDER BY ordinal_position;
+INSERT INTO public.test_slot VALUES (2, 20);
+UPDATE public.test_slot SET a = 21 WHERE id = 2;
+SELECT audit_operation, id, a FROM public.test_slot_audit ORDER BY audit_id;
+
+-- Rebuilding as the message says (keeping the old log aside) works
+SELECT pgaudix.disable('public.test_slot');
+ALTER TABLE public.test_slot_audit RENAME TO test_slot_audit_old;
+SELECT pgaudix.enable('public.test_slot');
+ALTER TABLE public.test_slot ADD COLUMN b int;
+INSERT INTO public.test_slot VALUES (3, 30, 300);
+SELECT audit_operation, id, a, b FROM public.test_slot_audit ORDER BY audit_id;
+SELECT count(*) AS old_log_rows FROM public.test_slot_audit_old;
+
+SELECT pgaudix.disable('public.test_slot', drop_data := true);
+DROP TABLE public.test_slot, public.test_slot_audit_old;
+
+-- ============================================================
+-- Test 68: dropping an unrelated table must not remove an orphan's audit table
+-- ============================================================
+-- drop_cleanup() matched an orphan registration (source lost on a restore,
+-- source_oid NULL) by name alone: creating and dropping an unrelated table
+-- with that name dropped the orphan's audit table and its history, which
+-- enable() refuses to replace precisely because it may hold history. Only a
+-- table that carried the pgaudix DML trigger was a source.
+CREATE TABLE public.test_orph (id int);
+SELECT pgaudix.enable('public.test_orph');
+INSERT INTO public.test_orph VALUES (1), (2);
+
+-- Restore that left the source out: the registry row and the audit table
+-- survive, the source does not
+ALTER EVENT TRIGGER pgaudix_drop_cleanup DISABLE;
+DROP TABLE public.test_orph;
+ALTER EVENT TRIGGER pgaudix_drop_cleanup ENABLE ALWAYS;
+
+-- An unrelated table takes the name and goes away again
+CREATE TABLE public.test_orph (a text);
+DROP TABLE public.test_orph;
+
+SELECT to_regclass('public.test_orph_audit') IS NOT NULL AS orphan_audit_kept,
+       (SELECT count(*) FROM pgaudix.monitored_tables
+        WHERE source_table = 'test_orph') AS registry_rows;
+SELECT audit_operation, id FROM public.test_orph_audit ORDER BY audit_id;
+SELECT source_table, audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table = 'test_orph';
+
+-- disable() is still the way to remove the orphan
+CREATE TABLE public.test_orph (a text);
+SELECT pgaudix.disable('public.test_orph', drop_data := true);
+SELECT to_regclass('public.test_orph_audit') IS NULL AS orphan_audit_dropped,
+       (SELECT count(*) FROM pgaudix.monitored_tables
+        WHERE source_table = 'test_orph') AS registry_rows;
+
+-- A real source drop still cleans up after itself
+SELECT pgaudix.enable('public.test_orph');
+DROP TABLE public.test_orph;
+SELECT to_regclass('public.test_orph_audit') IS NULL AS audit_dropped,
+       (SELECT count(*) FROM pgaudix.monitored_tables
+        WHERE source_table = 'test_orph') AS registry_rows;
+
+-- ============================================================
+-- Test 69: RENAME onto an orphan's name must not hand the table to the orphan
+-- ============================================================
+-- heal_registry() re-bound a registration by name to any relation carrying
+-- pgaudix_audit_trigger. Renaming a monitored table onto the name of an
+-- orphan registration gave the orphan the live table's OID and turned the
+-- live registration into the orphan: the trigger kept writing to the old
+-- audit table while status() reported the orphan's. A relation is the source
+-- of a registration only if its trigger names that registration's audit
+-- table; the rename is refused while the stale registration exists.
+CREATE TABLE public.test_ren_y (id int);
+SELECT pgaudix.enable('public.test_ren_y');
+INSERT INTO public.test_ren_y VALUES (1);
+ALTER EVENT TRIGGER pgaudix_drop_cleanup DISABLE;
+DROP TABLE public.test_ren_y;
+ALTER EVENT TRIGGER pgaudix_drop_cleanup ENABLE ALWAYS;
+
+CREATE TABLE public.test_ren_x (id int);
+SELECT pgaudix.enable('public.test_ren_x');
+INSERT INTO public.test_ren_x VALUES (10);
+
+DO $$
+BEGIN
+    ALTER TABLE public.test_ren_x RENAME TO test_ren_y;
+    RAISE NOTICE 'ERROR: the RENAME should have been refused (stale registration)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+
+-- Same when the orphan's audit table is already gone: the registry row alone
+-- blocks the name
+DROP TABLE public.test_ren_y_audit;
+DO $$
+BEGIN
+    ALTER TABLE public.test_ren_x RENAME TO test_ren_y;
+    RAISE NOTICE 'ERROR: the RENAME should have been refused (stale registration)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: %', SQLERRM;
+END;
+$$;
+
+-- Nothing moved: x is still bound to its own table, y is still the orphan
+SELECT source_table,
+       source_oid = 'public.test_ren_x'::regclass AS bound_to_x,
+       source_oid IS NULL AS orphan
+FROM pgaudix.monitored_tables
+WHERE source_table LIKE 'test\_ren\_%'
+ORDER BY source_table;
+INSERT INTO public.test_ren_x VALUES (11);
+SELECT audit_operation, id FROM public.test_ren_x_audit ORDER BY audit_id;
+
+-- Once the orphan is removed the rename goes through and is tracked
+CREATE TABLE public.test_ren_y (id int);
+SELECT pgaudix.disable('public.test_ren_y');
+DROP TABLE public.test_ren_y;
+ALTER TABLE public.test_ren_x RENAME TO test_ren_y;
+INSERT INTO public.test_ren_y VALUES (12);
+SELECT audit_operation, id FROM public.test_ren_y_audit ORDER BY audit_id;
+SELECT source_table, audit_table, audit_table_exists, dml_trigger_exists
+FROM pgaudix.status()
+WHERE source_table LIKE 'test\_ren\_%'
+ORDER BY source_table;
+
+SELECT pgaudix.disable('public.test_ren_y', drop_data := true);
+DROP TABLE public.test_ren_y;
 
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (

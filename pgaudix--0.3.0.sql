@@ -57,8 +57,10 @@ CREATE TABLE pgaudix.ddl_guard (
 -- source_oid / audit_oid are the authoritative keys at runtime, but they are
 -- invalid after a logical dump/restore. For every row whose OID no longer
 -- exists, look the table up again by (schema, name). The source is only
--- re-bound if it still carries the pgaudix DML trigger, so an unrelated table
--- that reused the name of a dropped source is never captured.
+-- re-bound if it is the source of that row (is_source_of(): it carries the
+-- pgaudix DML trigger naming the row's audit table), so an unrelated table
+-- that reused the name of a dropped source, or a monitored table renamed
+-- onto the name of a stale registration, is never captured.
 
 -- ============================================================
 -- reserved_columns(): the audit metadata column names
@@ -100,6 +102,51 @@ BEGIN
 END;
 $func$;
 
+-- ============================================================
+-- audit_tgarg(): the DML trigger argument for an audit table
+-- ============================================================
+-- The C trigger receives the audit table as one force-quoted
+-- "schema"."table" argument and validates that format. Built here for
+-- enable(), the RENAME handling of ddl_sync() and is_source_of().
+CREATE FUNCTION pgaudix.audit_tgarg(p_schema name, p_table name)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $func$
+    SELECT '"' || replace(p_schema::text, '"', '""')
+        || '"."' || replace(p_table::text, '"', '""') || '"'
+$func$;
+
+-- ============================================================
+-- is_source_of(): does this relation feed this audit table?
+-- ============================================================
+-- The DML trigger pins a source relation to its audit table: its argument
+-- names the audit table. That is the one fact that identifies the source of
+-- a registration, whatever happened to OIDs (restore, reuse) or names
+-- (RENAME, SET SCHEMA in progress): a relation is the source of a registry
+-- row if and only if it carries pgaudix_audit_trigger naming that row's
+-- audit table. A trigger merely named like ours (another registration's,
+-- or a clone inherited from a monitored partitioned root) does not count.
+CREATE FUNCTION pgaudix.is_source_of(p_rel oid, p_audit_schema name, p_audit_table name)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $func$
+    SELECT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_trigger t
+        WHERE t.tgrelid = p_rel
+          AND t.tgname = 'pgaudix_audit_trigger'
+          AND NOT t.tgisinternal
+          AND t.tgparentid = 0
+          AND t.tgargs = pg_catalog.convert_to(pgaudix.audit_tgarg(p_audit_schema, p_audit_table),
+                                               pg_catalog.getdatabaseencoding())
+                         || pg_catalog.decode('00', 'hex')
+    )
+$func$;
+
 CREATE FUNCTION pgaudix.heal_registry()
 RETURNS void
 LANGUAGE plpgsql
@@ -139,31 +186,16 @@ BEGIN
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
         WHERE n.nspname = mon.source_schema AND c.relname = mon.source_table
-          AND EXISTS (
-              SELECT 1 FROM pg_catalog.pg_trigger t
-              WHERE t.tgrelid = c.oid
-                AND t.tgname = 'pgaudix_audit_trigger'
-                AND NOT t.tgisinternal
-          );
+          AND pgaudix.is_source_of(c.oid, mon.audit_schema, mon.audit_table);
 
-        -- Name not found: keep the stored OID only while it still looks like
-        -- this source (a RENAME / ALTER SCHEMA in progress, before ddl_sync()
-        -- updates the registered names): it carries our trigger and its
-        -- current name is not the one another registry row registered. An
-        -- OID reused by an unrelated relation, or by another monitored
-        -- table, becomes NULL: the row is an orphan until disable() removes it.
-        IF v_src_oid IS NULL AND EXISTS (
-            SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mon.source_oid
-              AND t.tgname = 'pgaudix_audit_trigger'
-              AND NOT t.tgisinternal
-        ) AND NOT EXISTS (
-            SELECT 1 FROM pgaudix.monitored_tables o
-            JOIN pg_catalog.pg_class c ON c.oid = mon.source_oid
-            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-            WHERE o.id <> mon.id
-              AND o.source_schema = n.nspname AND o.source_table = c.relname
-        ) THEN
+        -- Name not found: keep the stored OID only while it is still this
+        -- source (a RENAME / ALTER SCHEMA in progress, before ddl_sync()
+        -- updates the registered names): its trigger names this row's audit
+        -- table. An OID reused by an unrelated relation, or by another
+        -- monitored table, becomes NULL: the row is an orphan until
+        -- disable() removes it.
+        IF v_src_oid IS NULL
+           AND pgaudix.is_source_of(mon.source_oid, mon.audit_schema, mon.audit_table) THEN
             v_src_oid := mon.source_oid;
         END IF;
 
@@ -649,9 +681,8 @@ BEGIN
 
     v_audit_fqn := format('%I.%I', v_schema, v_audit);
 
-    -- Build force-quoted form for C trigger argument validation (C2)
-    v_audit_tgarg := '"' || replace(v_schema::text, '"', '""')
-                  || '"."' || replace(v_audit::text, '"', '""') || '"';
+    -- Force-quoted form for C trigger argument validation (C2)
+    v_audit_tgarg := pgaudix.audit_tgarg(v_schema, v_audit);
 
     -- Check not already monitored
     IF EXISTS (
@@ -855,17 +886,13 @@ BEGIN
           AND (source_schema, source_table) = (v_schema, v_table);
     END IF;
 
-    -- The row must describe this table: same registered name, or at least our
-    -- trigger on it. A stale OID reused by an unrelated table after a restore
-    -- (not healed because the real source lost its trigger) matches neither,
-    -- and dropping the audit table for it would destroy another table's log.
+    -- The row must describe this table: same registered name, or at least
+    -- this table feeds the row's audit table. A stale OID reused by an
+    -- unrelated table after a restore (not healed because the real source
+    -- lost its trigger) matches neither, and dropping the audit table for it
+    -- would destroy another table's log.
     IF FOUND AND (mon.source_schema, mon.source_table) IS DISTINCT FROM (v_schema, v_table)
-       AND NOT EXISTS (
-           SELECT 1 FROM pg_catalog.pg_trigger t
-           WHERE t.tgrelid = target_table
-             AND t.tgname = 'pgaudix_audit_trigger'
-             AND NOT t.tgisinternal
-       ) THEN
+       AND NOT pgaudix.is_source_of(target_table, mon.audit_schema, mon.audit_table) THEN
         mon := NULL;
     END IF;
 
@@ -1108,12 +1135,7 @@ BEGIN
         CONTINUE WHEN v_new_schema IS NULL;
 
         -- Not our table (stale OID reused after a restore): leave it alone
-        CONTINUE WHEN NOT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = mon.source_oid
-              AND t.tgname = 'pgaudix_audit_trigger'
-              AND NOT t.tgisinternal
-        );
+        CONTINUE WHEN NOT pgaudix.is_source_of(mon.source_oid, mon.audit_schema, mon.audit_table);
 
         -- Current audit-table location (by OID — survives schema/table renames
         -- and tells us where the audit table ACTUALLY is, which differs between
@@ -1136,6 +1158,31 @@ BEGIN
            AND v_cur_audit_schema IS NOT DISTINCT FROM v_new_schema
            AND v_cur_audit_name   IS NOT DISTINCT FROM v_new_audit THEN
             CONTINUE;
+        END IF;
+
+        -- The new name must be free. A stale registration of it (source lost
+        -- on a restore) may still own an audit table with history: adopting
+        -- that name would leave two rows claiming one table. A relation
+        -- already using the new audit name is refused for the same reason,
+        -- with a clearer message than the RENAME's own.
+        IF EXISTS (
+            SELECT 1 FROM pgaudix.monitored_tables o
+            WHERE o.id <> mon.id
+              AND (o.source_schema, o.source_table) = (v_new_schema, v_new_table)
+        ) THEN
+            RAISE EXCEPTION 'pgaudix: cannot rename %.% to %.%: a stale registration of that name exists (its source table was not found); run pgaudix.disable(%) first',
+                mon.source_schema, mon.source_table, v_new_schema, v_new_table,
+                quote_literal(format('%I.%I', v_new_schema, v_new_table));
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = v_new_schema AND c.relname = v_new_audit
+              AND c.oid <> mon.audit_oid
+        ) THEN
+            RAISE EXCEPTION 'pgaudix: cannot rename %.% to %.%: audit table %.% already exists',
+                mon.source_schema, mon.source_table, v_new_schema, v_new_table,
+                v_new_schema, v_new_audit;
         END IF;
 
         -- Move the audit table into the source's (possibly new) schema. Required
@@ -1164,8 +1211,7 @@ BEGIN
             v_new_schema, v_new_table
         );
 
-        v_new_tgarg := '"' || replace(v_new_schema::text, '"', '""')
-                    || '"."' || replace(v_new_audit::text, '"', '""') || '"';
+        v_new_tgarg := pgaudix.audit_tgarg(v_new_schema, v_new_audit);
 
         EXECUTE format(
             'CREATE TRIGGER pgaudix_audit_trigger '
@@ -1258,12 +1304,7 @@ BEGIN
         -- A registered OID that was reused by another relation after a
         -- restore (and could not be healed because the real source lost its
         -- trigger) must not have its columns mirrored into the audit table.
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid = v_source_oid
-              AND t.tgname = 'pgaudix_audit_trigger'
-              AND NOT t.tgisinternal
-        ) THEN
+        IF NOT pgaudix.is_source_of(v_source_oid, mon.audit_schema, mon.audit_table) THEN
             RAISE WARNING 'pgaudix: %.% is registered but carries no pgaudix_audit_trigger; DDL not synced to the audit table',
                 mon.source_schema, mon.source_table;
             CONTINUE;
@@ -1336,7 +1377,9 @@ BEGIN
 
         -- --------------------------------------------------------
         -- Detect ADDED columns (in attnum order, so the audit table's new
-        -- attnums line up with the source's regardless of the scan plan)
+        -- attnums line up with the source's regardless of the scan plan).
+        -- A dropped attribute at the source column's slot is not a mirror
+        -- of it: the DML trigger would fail on the missing column.
         -- --------------------------------------------------------
         FOR cur IN
             SELECT a.attnum, a.attname,
@@ -1349,6 +1392,7 @@ BEGIN
                   SELECT 1 FROM pg_catalog.pg_attribute aud
                   WHERE aud.attrelid = v_audit_oid
                     AND aud.attnum = a.attnum + v_offset
+                    AND NOT aud.attisdropped
               )
             ORDER BY a.attnum
         LOOP
@@ -1359,6 +1403,22 @@ BEGIN
                 'ALTER TABLE %s ADD COLUMN %I %s',
                 v_audit_fqn, cur.attname, cur.atttype
             );
+
+            -- The new column must land on the source column's slot, or the
+            -- attnum mapping that drives RENAME / TYPE detection is lost for
+            -- good (attnums are never recycled). The slot is taken when a
+            -- column was added and dropped, or a mirrored column dropped,
+            -- directly on the audit table. Refuse the DDL rather than leave a
+            -- misaligned mirror whose columns would later be renamed astray.
+            IF (SELECT aud.attnum FROM pg_catalog.pg_attribute aud
+                WHERE aud.attrelid = v_audit_oid AND aud.attname = cur.attname
+                  AND NOT aud.attisdropped) <> cur.attnum + v_offset THEN
+                RAISE EXCEPTION 'pgaudix: audit table % is out of alignment with %.%: column % cannot take attnum % (the slot belongs to a column dropped directly from the audit table); rename the audit table to keep its history, then run pgaudix.disable(%) and pgaudix.enable(%) to rebuild it',
+                    v_audit_fqn, mon.source_schema, mon.source_table,
+                    cur.attname, cur.attnum + v_offset,
+                    quote_literal(format('%I.%I', mon.source_schema, mon.source_table)),
+                    quote_literal(format('%I.%I', mon.source_schema, mon.source_table));
+            END IF;
         END LOOP;
 
         -- --------------------------------------------------------
@@ -1486,24 +1546,33 @@ BEGIN
     -- the real source instead of deregistering it.
     PERFORM pgaudix.heal_registry();
 
+    -- Only a table that carried the pgaudix DML trigger was a source; the
+    -- trigger is dropped, and reported, along with its table. An unrelated
+    -- table that merely carried the name of a stale registration (source
+    -- lost on a restore, source_oid NULL) must not take that registration's
+    -- audit table, and its history, down with it.
     FOR obj IN
-        SELECT objid, schema_name, object_name
-        FROM pg_event_trigger_dropped_objects()
-        WHERE object_type = 'table'
+        SELECT o.objid, o.schema_name, o.object_name
+        FROM pg_event_trigger_dropped_objects() o
+        WHERE o.object_type = 'table'
+          AND EXISTS (
+              SELECT 1 FROM pg_event_trigger_dropped_objects() d
+              WHERE d.object_type = 'trigger'
+                AND d.address_names = ARRAY[o.schema_name, o.object_name, 'pgaudix_audit_trigger']
+          )
     LOOP
         -- The dropped table must carry the registered name (ddl_sync keeps
         -- the registered names equal to pg_class, so a registered OID that
         -- was reused by a differently named table after a restore never
-        -- matches) and either the registered OID or a stale one (restore,
-        -- not healed because the trigger was missing). An unrelated table
-        -- that merely carries the recorded name, while the registered OID is
-        -- still valid, must not deregister it.
+        -- matches) and either the registered OID or none: heal_registry()
+        -- just found no relation for the row, which is what a dropped source
+        -- looks like. A registered OID that still exists belongs to a
+        -- different, live relation, and its row stays.
         FOR mon IN
             SELECT mt.*
             FROM pgaudix.monitored_tables mt
             WHERE (mt.source_schema, mt.source_table) = (obj.schema_name, obj.object_name)
-              AND (mt.source_oid = obj.objid
-                   OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = mt.source_oid))
+              AND (mt.source_oid = obj.objid OR mt.source_oid IS NULL)
         LOOP
             -- Drop the audit table if it still exists (a DROP SCHEMA ... CASCADE
             -- may have removed it in the same statement)
@@ -1548,5 +1617,7 @@ REVOKE EXECUTE ON FUNCTION
     pgaudix.invoker(),
     pgaudix.audit_type(oid, integer),
     pgaudix.reserved_columns(),
-    pgaudix.audit_name(name)
+    pgaudix.audit_name(name),
+    pgaudix.audit_tgarg(name, name),
+    pgaudix.is_source_of(oid, name, name)
 FROM PUBLIC;
