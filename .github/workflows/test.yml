@@ -107,13 +107,15 @@ jobs:
           make USE_PGXS=1
           make USE_PGXS=1 install
 
+      # Both loopbacks: psql's \c reconnects to "localhost" over ::1 and
+      # does not fall back to 127.0.0.1
       - name: Run tests
         shell: msys2 {0}
         run: |
           export PGUSER=postgres
           export PGHOST=127.0.0.1
           initdb -D /tmp/pgdata -U postgres -A trust
-          pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-c listen_addresses=127.0.0.1" start
+          pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-c listen_addresses=127.0.0.1,::1" start
           make USE_PGXS=1 installcheck
 
       - name: Show test diff on failure
