@@ -102,12 +102,13 @@ jobs:
       # Windows; pg_regress connects over TCP to localhost (trust by default).
       # The server listens on both loopbacks: psql's \c reconnects to
       # "localhost" over ::1 and does not fall back to 127.0.0.1.
+      # UTF8 like the other platforms: initdb picks WIN1252 on the runner.
       - name: Run tests
         shell: msys2 {0}
         run: |
           export PGUSER=postgres
           export PGHOST=127.0.0.1
-          initdb -D /tmp/pgdata -U postgres -A trust
+          initdb -D /tmp/pgdata -U postgres -A trust -E UTF8 --no-locale
           pg_ctl -D /tmp/pgdata -l /tmp/pg.log -o "-c listen_addresses=127.0.0.1,::1" start
           make USE_PGXS=1 installcheck
 
