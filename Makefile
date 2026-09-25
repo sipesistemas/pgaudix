@@ -2,7 +2,7 @@ EXTENSION    = pgaudix
 MODULE_big   = pgaudix
 OBJS         = src/pgaudix.o
 
-DATA         = pgaudix--0.3.0.sql
+DATA         = pgaudix--1.0.0.sql
 PGFILEDESC   = "pgaudix - automatic table auditing with column mirroring"
 
 REGRESS      = pgaudix_test

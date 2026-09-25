@@ -19,8 +19,8 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 ## Key Files
 
 - `src/pgaudix.c` — C DML trigger function using SPI
-- `pgaudix--0.3.0.sql` — full SQL install script for fresh installs (current version)
-- Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--0.3.0--X.Y.Z.sql` delta; never rewrite a released script in place
+- `pgaudix--1.0.0.sql` — full SQL install script for fresh installs (current version)
+- Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--1.0.0--X.Y.Z.sql` delta; never rewrite a released script in place
 - `Makefile` — PGXS build (`make USE_PGXS=1`)
 - `pgaudix.control` — Extension metadata
 
@@ -38,7 +38,7 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 - `audit_app_user` and `audit_app_user_ip` (both `text`) come from the `pgaudix.app_user` / `pgaudix.app_user_ip` GUCs that the application sets per transaction (`SET LOCAL`); NULL when unset (`NULLIF(..., '')`, because `current_setting(..., true)` returns `''` once the GUC was ever set in the session)
 - Mirrored columns keep their original names
 - Extension schema: `pgaudix`
-- Version: 0.3.0
+- Version: 1.0.0 (first production release; no upgrade path from the 0.x pre-releases)
 
 ## Development Environment
 

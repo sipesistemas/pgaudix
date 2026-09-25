@@ -270,7 +270,7 @@ pgaudix/
 ├── docker-compose.yml          # Dev environment on port 5433
 ├── Makefile                    # PGXS build system
 ├── pgaudix.control            # Extension metadata
-├── pgaudix--0.3.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── pgaudix--1.0.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
 ├── install.sh / install.bat   # Install a release build (Linux/macOS, Windows)
 ├── src/
 │   ├── pgaudix.h              # Constants and declarations

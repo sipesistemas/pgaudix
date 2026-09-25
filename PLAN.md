@@ -47,7 +47,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - Uses parameterized `SPI_execute_with_args()` with error checking
 - `SECURITY DEFINER` with `SET search_path` for audit table write access
 
-### SQL install script (`pgaudix--0.3.0.sql`)
+### SQL install script (`pgaudix--1.0.0.sql`)
 - `pgaudix.monitored_tables` — registration table with `source_oid` for OID-based lookup
 - `pgaudix.enable(regclass)` — creates audit table (with attnum gap alignment), triggers, registration. Serialized with LOCK TABLE.
 - `pgaudix.disable(regclass, bool)` — drops triggers, optionally drops audit table
