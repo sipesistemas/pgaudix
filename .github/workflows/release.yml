@@ -87,6 +87,7 @@ jobs:
             mingw-w64-ucrt-x86_64-postgresql
             make
             zip
+            diffutils
 
       - name: Build and install extension
         shell: msys2 {0}
