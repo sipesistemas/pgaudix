@@ -614,6 +614,8 @@ DECLARE
     v_cols      text := '';
     v_relkind   "char";
     v_relpersist "char";
+    v_relispart boolean;
+    v_inherit   text;
     v_max_attnum int;
     v_audit_oid oid;
     v_gap       name;
@@ -629,18 +631,54 @@ BEGIN
     -- Re-bind registry rows whose OIDs went stale (pg_dump/restore)
     PERFORM pgaudix.heal_registry();
 
-    -- Resolve schema, table name, relkind and persistence
-    SELECT n.nspname, c.relname, c.relkind, c.relpersistence
-    INTO v_schema, v_table, v_relkind, v_relpersist
+    -- Resolve schema, table name, relkind, persistence and partition status
+    SELECT n.nspname, c.relname, c.relkind, c.relpersistence, c.relispartition
+    INTO v_schema, v_table, v_relkind, v_relpersist, v_relispart
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
     WHERE c.oid = target_table;
 
+    -- Partitioned tables and table inheritance are not supported: a
+    -- pg_dump/pg_restore of an audited partition tree can lose rows, and one
+    -- of an audited inheritance child can leave it unaudited. ddl_sync()
+    -- keeps an audited table from joining either later.
+    IF v_relkind = 'p' THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: partitioned tables are not supported',
+            v_schema, v_table
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF v_relispart THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: it is a partition of %; partitioned tables are not supported',
+            v_schema, v_table,
+            (SELECT i.inhparent::regclass FROM pg_catalog.pg_inherits i WHERE i.inhrelid = target_table)
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
     -- Reject views, materialized views, foreign tables, indexes, sequences, etc. (A5)
-    -- Only ordinary tables ('r') and partitioned tables ('p') are supported.
-    IF v_relkind NOT IN ('r', 'p') THEN
-        RAISE EXCEPTION 'pgaudix: %.% is not a regular or partitioned table (relkind=%)',
+    -- Only ordinary tables ('r') are supported.
+    IF v_relkind <> 'r' THEN
+        RAISE EXCEPTION 'pgaudix: %.% is not a regular table (relkind=%)',
             v_schema, v_table, v_relkind;
+    END IF;
+
+    SELECT string_agg(i.inhparent::regclass::text, ', ' ORDER BY i.inhseqno)
+    INTO v_inherit
+    FROM pg_catalog.pg_inherits i
+    WHERE i.inhrelid = target_table;
+    IF v_inherit IS NOT NULL THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: it inherits from %; table inheritance (INHERITS) is not supported',
+            v_schema, v_table, v_inherit
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
+    SELECT string_agg(i.inhrelid::regclass::text, ', ' ORDER BY i.inhrelid::regclass::text)
+    INTO v_inherit
+    FROM pg_catalog.pg_inherits i
+    WHERE i.inhparent = target_table;
+    IF v_inherit IS NOT NULL THEN
+        RAISE EXCEPTION 'pgaudix: cannot audit %.%: inherited by %; table inheritance (INHERITS) is not supported',
+            v_schema, v_table, v_inherit
+            USING ERRCODE = 'feature_not_supported';
     END IF;
 
     -- Reject system catalogs to avoid catastrophic side effects
@@ -1109,6 +1147,36 @@ BEGIN
 
     -- Re-bind registry rows whose OIDs went stale (pg_dump/restore)
     PERFORM pgaudix.heal_registry();
+
+    -- Partitioned tables and table inheritance are not supported (see
+    -- enable()): refuse a command that made an audited table a partition,
+    -- an inheritance child or an inheritance parent (ATTACH PARTITION,
+    -- INHERIT, CREATE TABLE ... INHERITS). The command's tables, their
+    -- descendants and their ancestors cover every way in.
+    FOR cur IN
+        SELECT mt.source_schema, mt.source_table
+        FROM pgaudix.monitored_tables mt
+        WHERE mt.source_oid IN (
+                  WITH RECURSIVE up(relid) AS (
+                      SELECT relid FROM unnest(v_affected_tables || v_created_tables) AS t(relid)
+                      UNION
+                      SELECT i.inhparent
+                      FROM pg_catalog.pg_inherits i
+                      JOIN up ON i.inhrelid = up.relid
+                  )
+                  SELECT relid FROM up
+              )
+          AND EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_inherits i
+                  WHERE i.inhrelid = mt.source_oid OR i.inhparent = mt.source_oid
+              )
+        ORDER BY mt.id
+    LOOP
+        RAISE EXCEPTION 'pgaudix: %.% is audited and cannot be part of a partition tree or an inheritance hierarchy (not supported); run pgaudix.disable(%) first',
+            cur.source_schema, cur.source_table,
+            quote_literal(format('%I.%I', cur.source_schema, cur.source_table))
+            USING ERRCODE = 'feature_not_supported';
+    END LOOP;
 
     -- ----------------------------------------------------------------
     -- Pre-pass: sync source_schema / source_table / audit_schema /

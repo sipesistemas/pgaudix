@@ -853,7 +853,7 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: enable on view rejected: %', SQLERRM;
 END;
 $$;
-NOTICE:  OK: enable on view rejected: pgaudix: public.test_a5_view is not a regular or partitioned table (relkind=v)
+NOTICE:  OK: enable on view rejected: pgaudix: public.test_a5_view is not a regular table (relkind=v)
 DROP VIEW public.test_a5_view;
 CREATE MATERIALIZED VIEW public.test_a5_mv AS SELECT 1 AS v;
 DO $$
@@ -864,7 +864,7 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE 'OK: enable on materialized view rejected: %', SQLERRM;
 END;
 $$;
-NOTICE:  OK: enable on materialized view rejected: pgaudix: public.test_a5_mv is not a regular or partitioned table (relkind=m)
+NOTICE:  OK: enable on materialized view rejected: pgaudix: public.test_a5_mv is not a regular table (relkind=m)
 DROP MATERIALIZED VIEW public.test_a5_mv;
 -- ============================================================
 -- Test 31: A1 — enable() rejects names that would overflow NAMEDATALEN
@@ -1385,40 +1385,87 @@ SELECT pgaudix.disable('public.test_order', drop_data := true);
 
 DROP TABLE public.test_order;
 -- ============================================================
--- Test 42: DDL propagated through inheritance / partitioning is synced
+-- Test 42: partitioned tables and table inheritance are rejected
 -- ============================================================
--- pg_event_trigger_ddl_commands() only reports the table named in the
--- ALTER, so descendants must be expanded explicitly
+-- Not supported: a pg_dump/pg_restore of an audited partition tree can lose
+-- rows (pg_restore -j truncates a partition before loading it, and the
+-- partition's triggers fire), and one of an audited inheritance child can
+-- leave it unaudited (the restored child lists its inherited columns first,
+-- out of line with its audit table). enable() refuses both up front and
+-- creates nothing.
+CREATE TABLE public.test_proot (id int, k int) PARTITION BY LIST (k);
+CREATE TABLE public.test_p1 PARTITION OF public.test_proot FOR VALUES IN (1);
 CREATE TABLE public.test_parent (id int);
 CREATE TABLE public.test_child (extra text) INHERITS (public.test_parent);
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['public.test_proot', 'public.test_p1',
+                             'public.test_child', 'public.test_parent'] LOOP
+        BEGIN
+            PERFORM pgaudix.enable(t::regclass);
+            RAISE NOTICE 'ERROR: enable(%) should have been refused', t;
+        EXCEPTION WHEN feature_not_supported THEN
+            RAISE NOTICE 'OK: %', SQLERRM;
+        END;
+    END LOOP;
+END;
+$$;
+NOTICE:  OK: pgaudix: cannot audit public.test_proot: partitioned tables are not supported
+NOTICE:  OK: pgaudix: cannot audit public.test_p1: it is a partition of public.test_proot; partitioned tables are not supported
+NOTICE:  OK: pgaudix: cannot audit public.test_child: it inherits from public.test_parent; table inheritance (INHERITS) is not supported
+NOTICE:  OK: pgaudix: cannot audit public.test_parent: inherited by public.test_child; table inheritance (INHERITS) is not supported
+-- Nothing was registered or created
+SELECT count(*) AS registry_rows
+FROM pgaudix.monitored_tables
+WHERE source_table IN ('test_proot', 'test_p1', 'test_child', 'test_parent');
+ registry_rows 
+---------------
+             0
+(1 row)
+
+SELECT count(*) AS audit_tables
+FROM pg_catalog.pg_class
+WHERE relname IN ('test_proot_audit', 'test_p1_audit', 'test_child_audit', 'test_parent_audit');
+ audit_tables 
+--------------
+            0
+(1 row)
+
+SELECT count(*) AS pgaudix_triggers
+FROM pg_catalog.pg_trigger
+WHERE tgname LIKE 'pgaudix\_%'
+  AND tgrelid IN ('public.test_proot'::regclass, 'public.test_p1'::regclass,
+                  'public.test_child'::regclass, 'public.test_parent'::regclass);
+ pgaudix_triggers 
+------------------
+                0
+(1 row)
+
+-- Once out of the hierarchy, both tables can be audited
+ALTER TABLE public.test_child NO INHERIT public.test_parent;
 SELECT pgaudix.enable('public.test_child');
  enable 
 --------
  
 (1 row)
 
-ALTER TABLE public.test_parent ADD COLUMN newcol int;
-ALTER TABLE public.test_parent RENAME COLUMN id TO id2;
-SELECT column_name
-FROM information_schema.columns
-WHERE table_schema = 'public' AND table_name = 'test_child_audit'
-  AND column_name NOT LIKE 'audit\_%'
-ORDER BY ordinal_position;
- column_name 
--------------
- id2
- extra
- newcol
-(3 rows)
-
-INSERT INTO public.test_child VALUES (1, 'x', 2);
-SELECT audit_operation, id2, extra, newcol
-FROM public.test_child_audit
-ORDER BY audit_id;
- audit_operation | id2 | extra | newcol 
------------------+-----+-------+--------
- I               |   1 | x     |      2
+SELECT pgaudix.enable('public.test_parent');
+ enable 
+--------
+ 
 (1 row)
+
+SELECT source_table, audit_table_exists, dml_trigger_enabled
+FROM pgaudix.status()
+WHERE source_table IN ('test_child', 'test_parent')
+ORDER BY source_table;
+ source_table | audit_table_exists | dml_trigger_enabled 
+--------------+--------------------+---------------------
+ test_child   | t                  | t
+ test_parent  | t                  | t
+(2 rows)
 
 SELECT pgaudix.disable('public.test_child', drop_data := true);
  disable 
@@ -1426,106 +1473,102 @@ SELECT pgaudix.disable('public.test_child', drop_data := true);
  
 (1 row)
 
-DROP TABLE public.test_child;
-DROP TABLE public.test_parent;
--- A partition audited directly must follow ALTERs on its root
-CREATE TABLE public.test_proot (id int, k int) PARTITION BY LIST (k);
-CREATE TABLE public.test_p1 PARTITION OF public.test_proot FOR VALUES IN (1);
-SELECT pgaudix.enable('public.test_p1');
- enable 
---------
- 
-(1 row)
-
-ALTER TABLE public.test_proot ADD COLUMN v text;
-SELECT column_name
-FROM information_schema.columns
-WHERE table_schema = 'public' AND table_name = 'test_p1_audit'
-  AND column_name = 'v';
- column_name 
--------------
- v
-(1 row)
-
-INSERT INTO public.test_proot VALUES (1, 1, 'a');
-SELECT audit_operation, id, k, v
-FROM public.test_p1_audit
-ORDER BY audit_id;
- audit_operation | id | k | v 
------------------+----+---+---
- I               |  1 | 1 | a
-(1 row)
-
-SELECT pgaudix.disable('public.test_p1', drop_data := true);
+SELECT pgaudix.disable('public.test_parent', drop_data := true);
  disable 
 ---------
  
 (1 row)
 
-DROP TABLE public.test_proot;
+DROP TABLE public.test_child, public.test_parent, public.test_proot;
 -- ============================================================
--- Test 43: partition-leaf TRUNCATE triggers follow RENAME, ATTACH and DETACH
+-- Test 43: an audited table cannot join a partition tree or an inheritance hierarchy
 -- ============================================================
-CREATE TABLE public.test_pr (id int, k int) PARTITION BY LIST (k);
-CREATE TABLE public.test_pr_1 PARTITION OF public.test_pr FOR VALUES IN (1);
-SELECT pgaudix.enable('public.test_pr');
+-- enable() refuses these tables, so DDL that would make an audited table a
+-- partition (ATTACH PARTITION), an inheritance child (INHERIT) or an
+-- inheritance parent (INHERIT from another table, CREATE TABLE ... INHERITS)
+-- is refused by ddl_sync(), and the table stays audited as it was.
+CREATE TABLE public.test_solo (id int, k int);
+SELECT pgaudix.enable('public.test_solo');
  enable 
 --------
  
 (1 row)
 
--- Rename the root: the leaf trigger must point at the renamed audit table
-ALTER TABLE public.test_pr RENAME TO test_pr2;
-NOTICE:  pgaudix: synchronized audit registration to public.test_pr2_audit
-TRUNCATE public.test_pr_1;
--- A partition attached after enable() must be audited too
-CREATE TABLE public.test_pr_2 (id int, k int);
-ALTER TABLE public.test_pr2 ATTACH PARTITION public.test_pr_2 FOR VALUES IN (2);
-TRUNCATE public.test_pr_2;
-SELECT count(*) AS truncate_rows
-FROM public.test_pr2_audit
-WHERE audit_operation = 'T';
- truncate_rows 
----------------
-             2
+CREATE TABLE public.test_other (id int, k int);
+CREATE TABLE public.test_root (id int, k int) PARTITION BY LIST (k);
+DO $$
+DECLARE
+    cmd text;
+BEGIN
+    FOREACH cmd IN ARRAY ARRAY[
+        'ALTER TABLE public.test_root ATTACH PARTITION public.test_solo FOR VALUES IN (1)',
+        'ALTER TABLE public.test_solo INHERIT public.test_other',
+        'ALTER TABLE public.test_other INHERIT public.test_solo',
+        'CREATE TABLE public.test_sub () INHERITS (public.test_solo)'] LOOP
+        BEGIN
+            EXECUTE cmd;
+            RAISE NOTICE 'ERROR: should have been refused: %', cmd;
+        EXCEPTION WHEN feature_not_supported THEN
+            RAISE NOTICE 'OK: %', SQLERRM;
+        END;
+    END LOOP;
+END;
+$$;
+NOTICE:  OK: pgaudix: public.test_solo is audited and cannot be part of a partition tree or an inheritance hierarchy (not supported); run pgaudix.disable('public.test_solo') first
+NOTICE:  OK: pgaudix: public.test_solo is audited and cannot be part of a partition tree or an inheritance hierarchy (not supported); run pgaudix.disable('public.test_solo') first
+NOTICE:  OK: pgaudix: public.test_solo is audited and cannot be part of a partition tree or an inheritance hierarchy (not supported); run pgaudix.disable('public.test_solo') first
+NOTICE:  OK: pgaudix: public.test_solo is audited and cannot be part of a partition tree or an inheritance hierarchy (not supported); run pgaudix.disable('public.test_solo') first
+-- Nothing changed: no inheritance link, no new table, still audited
+SELECT count(*) AS inheritance_links
+FROM pg_catalog.pg_inherits
+WHERE 'public.test_solo'::regclass IN (inhrelid, inhparent);
+ inheritance_links 
+-------------------
+                 0
 (1 row)
 
--- A detached partition must not keep writing into the root's audit table
-ALTER TABLE public.test_pr2 DETACH PARTITION public.test_pr_1;
-SELECT count(*) AS leaf_triggers_after_detach
-FROM pg_catalog.pg_trigger
-WHERE tgrelid = 'public.test_pr_1'::regclass AND tgname = 'pgaudix_truncate_trigger';
- leaf_triggers_after_detach 
-----------------------------
-                          0
+SELECT to_regclass('public.test_sub') IS NULL AS sub_not_created;
+ sub_not_created 
+-----------------
+ t
 (1 row)
 
-TRUNCATE public.test_pr_1;
-SELECT count(*) AS truncate_rows_after_detach
-FROM public.test_pr2_audit
-WHERE audit_operation = 'T';
- truncate_rows_after_detach 
-----------------------------
-                          2
+INSERT INTO public.test_solo VALUES (1, 1);
+SELECT audit_operation, id, k FROM public.test_solo_audit ORDER BY audit_id;
+ audit_operation | id | k 
+-----------------+----+---
+ I               |  1 | 1
 (1 row)
 
--- disable() removes the remaining leaf trigger
-SELECT pgaudix.disable('public.test_pr2', drop_data := true);
+-- Tables that are not audited use inheritance and partitioning freely
+CREATE TABLE public.test_sub () INHERITS (public.test_other);
+CREATE TABLE public.test_p2 PARTITION OF public.test_root FOR VALUES IN (2);
+SELECT inhrelid::regclass::text AS child, inhparent::regclass::text AS parent
+FROM pg_catalog.pg_inherits
+WHERE inhparent IN ('public.test_other'::regclass, 'public.test_root'::regclass)
+ORDER BY 1;
+  child   |   parent   
+----------+------------
+ test_p2  | test_root
+ test_sub | test_other
+(2 rows)
+
+-- After disable() the table is free to join
+SELECT pgaudix.disable('public.test_solo', drop_data := true);
  disable 
 ---------
  
 (1 row)
 
-SELECT count(*) AS leaf_triggers_after_disable
-FROM pg_catalog.pg_trigger
-WHERE tgrelid = 'public.test_pr_2'::regclass AND tgname = 'pgaudix_truncate_trigger';
- leaf_triggers_after_disable 
------------------------------
-                           0
+ALTER TABLE public.test_root ATTACH PARTITION public.test_solo FOR VALUES IN (1);
+SELECT count(*) AS partitions FROM pg_catalog.pg_inherits
+WHERE inhparent = 'public.test_root'::regclass;
+ partitions 
+------------
+          2
 (1 row)
 
-DROP TABLE public.test_pr2;
-DROP TABLE public.test_pr_1;
+DROP TABLE public.test_root, public.test_sub, public.test_other;
 -- ============================================================
 -- Test 44: DDL sync and drop cleanup also run under replica role
 -- ============================================================
@@ -1672,7 +1715,7 @@ SELECT pgaudix.enable('public.test_priv_other2');
 ERROR:  pgaudix: must be owner of table public.test_priv_other2 to manage its auditing
 CONTEXT:  PL/pgSQL function check_table_owner(regclass) line 19 at RAISE
 SQL statement "SELECT pgaudix.check_table_owner(target_table)"
-PL/pgSQL function enable(regclass) line 18 at PERFORM
+PL/pgSQL function enable(regclass) line 20 at PERFORM
 SELECT pgaudix.disable('public.test_priv_other', drop_data := true);
 ERROR:  pgaudix: must be owner of table public.test_priv_other to manage its auditing
 CONTEXT:  PL/pgSQL function check_table_owner(regclass) line 19 at RAISE
@@ -1714,56 +1757,6 @@ DROP TABLE public.test_priv_other2;
 DROP OWNED BY pgaudix_test_owner, pgaudix_test_other;
 DROP ROLE pgaudix_test_owner;
 DROP ROLE pgaudix_test_other;
--- ============================================================
--- Test 47: one T row per TRUNCATE statement on a partitioned table
--- ============================================================
-CREATE TABLE public.test_tr (id int, k int) PARTITION BY LIST (k);
-CREATE TABLE public.test_tr_1 PARTITION OF public.test_tr FOR VALUES IN (1);
-CREATE TABLE public.test_tr_2 PARTITION OF public.test_tr FOR VALUES IN (2);
-SELECT pgaudix.enable('public.test_tr');
- enable 
---------
- 
-(1 row)
-
--- TRUNCATE of the root fires the statement triggers of the root and of every
--- partition; only one audit row must be written
-TRUNCATE public.test_tr;
-SELECT count(*) AS rows_after_root_truncate
-FROM public.test_tr_audit WHERE audit_operation = 'T';
- rows_after_root_truncate 
---------------------------
-                        1
-(1 row)
-
--- A partition truncated directly is still audited
-TRUNCATE public.test_tr_1;
-SELECT count(*) AS rows_after_leaf_truncate
-FROM public.test_tr_audit WHERE audit_operation = 'T';
- rows_after_leaf_truncate 
---------------------------
-                        2
-(1 row)
-
--- Separate statements in one transaction are separate operations
-BEGIN;
-    TRUNCATE public.test_tr_2;
-    TRUNCATE public.test_tr;
-COMMIT;
-SELECT count(*) AS rows_after_two_statements
-FROM public.test_tr_audit WHERE audit_operation = 'T';
- rows_after_two_statements 
----------------------------
-                         4
-(1 row)
-
-SELECT pgaudix.disable('public.test_tr', drop_data := true);
- disable 
----------
- 
-(1 row)
-
-DROP TABLE public.test_tr;
 -- ============================================================
 -- Test 48: domain columns are mirrored with the domain's base type
 -- ============================================================
@@ -1900,10 +1893,10 @@ ORDER BY audit_id;
 -- The broken tables report their own problem only when they are altered
 ALTER TABLE public.test_broken ADD COLUMN y int;
 ERROR:  pgaudix: audit table public.test_broken_audit is missing — cannot sync DDL
-CONTEXT:  PL/pgSQL function ddl_sync() line 301 at RAISE
+CONTEXT:  PL/pgSQL function ddl_sync() line 331 at RAISE
 ALTER TABLE public.test_conflict2 ADD COLUMN y int;
 ERROR:  pgaudix: cannot rename public.test_conflict to public.test_conflict2: audit table public.test_conflict2_audit already exists
-CONTEXT:  PL/pgSQL function ddl_sync() line 164 at RAISE
+CONTEXT:  PL/pgSQL function ddl_sync() line 194 at RAISE
 -- Cleanup
 SELECT pgaudix.disable('public.test_unrelated', drop_data := true);
  disable 
@@ -2015,38 +2008,6 @@ SELECT pgaudix.disable('public.test_cache2', drop_data := true);
 (1 row)
 
 DROP TABLE public.test_cache2;
--- Partitions with different physical layouts share one audit table
-CREATE TABLE public.test_cpart (id int, k int, v text) PARTITION BY LIST (k);
-CREATE TABLE public.test_cpart_1 PARTITION OF public.test_cpart FOR VALUES IN (1);
-CREATE TABLE public.test_cpart_2 (id int, junk int, k int, v text);
-ALTER TABLE public.test_cpart_2 DROP COLUMN junk;
-ALTER TABLE public.test_cpart ATTACH PARTITION public.test_cpart_2 FOR VALUES IN (2);
-SELECT pgaudix.enable('public.test_cpart');
- enable 
---------
- 
-(1 row)
-
-INSERT INTO public.test_cpart VALUES (1, 1, 'p1'), (2, 2, 'p2'), (3, 1, 'p1 again');
-UPDATE public.test_cpart SET v = v || '!' WHERE id = 2;
-SELECT audit_operation, id, k, v
-FROM public.test_cpart_audit
-ORDER BY audit_id;
- audit_operation | id | k |    v     
------------------+----+---+----------
- I               |  1 | 1 | p1
- I               |  2 | 2 | p2
- I               |  3 | 1 | p1 again
- U               |  2 | 2 | p2!
-(4 rows)
-
-SELECT pgaudix.disable('public.test_cpart', drop_data := true);
- disable 
----------
- 
-(1 row)
-
-DROP TABLE public.test_cpart;
 -- ============================================================
 -- Test 52: audit_app_user / audit_app_user_ip record what the application sets via GUC
 -- ============================================================
@@ -2584,8 +2545,8 @@ DROP TABLE public.test_dc_src;
 -- ============================================================
 -- Test 59: every TRUNCATE is recorded, also inside one top-level statement
 -- ============================================================
--- The partition dedup must not swallow a second TRUNCATE of the same table
--- issued from a DO block or PL/pgSQL function (same statement_timestamp()).
+-- A second TRUNCATE of the same table issued from a DO block or PL/pgSQL
+-- function (same statement_timestamp()) is a separate operation.
 CREATE TABLE public.test_trunc2 (id int);
 SELECT pgaudix.enable('public.test_trunc2');
  enable 
@@ -2610,92 +2571,6 @@ ORDER BY audit_operation;
  T               |     2
 (2 rows)
 
--- Partitioned root inside a DO block: one T per TRUNCATE statement, still
-CREATE TABLE public.test_trunc2_part (id int, k int) PARTITION BY LIST (k);
-CREATE TABLE public.test_trunc2_p1 PARTITION OF public.test_trunc2_part FOR VALUES IN (1);
-CREATE TABLE public.test_trunc2_p2 PARTITION OF public.test_trunc2_part FOR VALUES IN (2);
-SELECT pgaudix.enable('public.test_trunc2_part');
- enable 
---------
- 
-(1 row)
-
-DO $$
-BEGIN
-    TRUNCATE public.test_trunc2_part;
-    TRUNCATE public.test_trunc2_part;
-END;
-$$;
-SELECT audit_operation, count(*)
-FROM public.test_trunc2_part_audit
-GROUP BY audit_operation
-ORDER BY audit_operation;
- audit_operation | count 
------------------+-------
- T               |     2
-(1 row)
-
--- Two-level tree: the intermediate partitioned table has no data of its
--- own but is truncated as a unit, and a statement naming a leaf together
--- with the root still counts as one TRUNCATE
-CREATE TABLE public.test_trunc2_mid PARTITION OF public.test_trunc2_part
-    FOR VALUES IN (3) PARTITION BY LIST (id);
-CREATE TABLE public.test_trunc2_mid_a PARTITION OF public.test_trunc2_mid FOR VALUES IN (1);
-CREATE TABLE public.test_trunc2_mid_b PARTITION OF public.test_trunc2_mid FOR VALUES IN (2);
-SELECT tgrelid::regclass AS rel,
-       CASE WHEN tgtype & 2 = 2 THEN 'BEFORE' ELSE 'AFTER' END AS timing
-FROM pg_catalog.pg_trigger
-WHERE tgname = 'pgaudix_truncate_trigger'
-  AND tgrelid::regclass::text LIKE 'test_trunc2_%'
-ORDER BY tgrelid::regclass::text;
-        rel        | timing 
--------------------+--------
- test_trunc2_mid   | BEFORE
- test_trunc2_mid_a | AFTER
- test_trunc2_mid_b | AFTER
- test_trunc2_p1    | AFTER
- test_trunc2_p2    | AFTER
- test_trunc2_part  | BEFORE
-(6 rows)
-
-TRUNCATE public.test_trunc2_part_audit;
-TRUNCATE public.test_trunc2_part;                        -- root: 1
-TRUNCATE public.test_trunc2_mid;                         -- intermediate: 1
-TRUNCATE public.test_trunc2_mid_a;                       -- leaf: 1
-TRUNCATE public.test_trunc2_p1, public.test_trunc2_part; -- leaf + root: 1
-TRUNCATE public.test_trunc2_p1, public.test_trunc2_p2;   -- two leaves: 2
-TRUNCATE public.test_trunc2_mid, public.test_trunc2_part; -- intermediate + root: 1
-TRUNCATE public.test_trunc2_mid_a, public.test_trunc2_mid; -- leaf + intermediate: 1
-DO $$
-BEGIN
-    TRUNCATE public.test_trunc2_mid;                       -- 1
-    TRUNCATE public.test_trunc2_part;                      -- 1
-    TRUNCATE public.test_trunc2_mid_b;                     -- 1
-END;
-$$;
-SELECT audit_operation, count(*)
-FROM public.test_trunc2_part_audit
-GROUP BY audit_operation
-ORDER BY audit_operation;
- audit_operation | count 
------------------+-------
- T               |    11
-(1 row)
-
--- 11 T rows expected (1+1+1+1+2+1+1+3), no pending records left
-SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
- pending_rows 
---------------
-            0
-(1 row)
-
-SELECT pgaudix.disable('public.test_trunc2_part', drop_data := true);
- disable 
----------
- 
-(1 row)
-
-DROP TABLE public.test_trunc2_part;
 SELECT pgaudix.disable('public.test_trunc2', drop_data := true);
  disable 
 ---------
@@ -2737,49 +2612,6 @@ SELECT pgaudix.disable('public.test_ro', drop_data := true);
 (1 row)
 
 DROP TABLE public.test_ro;
--- ============================================================
--- Test 61: a partition created after enable() gets its TRUNCATE trigger
--- ============================================================
--- CREATE TABLE ... PARTITION OF is not an ALTER TABLE; the event trigger
--- must still reconcile the per-leaf triggers so a direct TRUNCATE of the
--- new partition is audited.
-CREATE TABLE public.test_newpart (id int, k int) PARTITION BY LIST (k);
-CREATE TABLE public.test_newpart_p1 PARTITION OF public.test_newpart FOR VALUES IN (1);
-SELECT pgaudix.enable('public.test_newpart');
- enable 
---------
- 
-(1 row)
-
-CREATE TABLE public.test_newpart_p2 PARTITION OF public.test_newpart FOR VALUES IN (2);
-SELECT tgrelid::regclass AS leaf, tgenabled
-FROM pg_catalog.pg_trigger
-WHERE tgname = 'pgaudix_truncate_trigger'
-  AND tgrelid IN ('public.test_newpart_p1'::regclass, 'public.test_newpart_p2'::regclass)
-ORDER BY tgrelid::regclass::text;
-      leaf       | tgenabled 
------------------+-----------
- test_newpart_p1 | A
- test_newpart_p2 | A
-(2 rows)
-
-TRUNCATE public.test_newpart_p2;
-SELECT audit_operation, count(*)
-FROM public.test_newpart_audit
-GROUP BY audit_operation
-ORDER BY audit_operation;
- audit_operation | count 
------------------+-------
- T               |     1
-(1 row)
-
-SELECT pgaudix.disable('public.test_newpart', drop_data := true);
- disable 
----------
- 
-(1 row)
-
-DROP TABLE public.test_newpart;
 -- ============================================================
 -- Test 62: heal_registry() survives OIDs swapped between monitored tables
 -- ============================================================
@@ -3088,74 +2920,6 @@ SELECT pgaudix.disable('public.renamed_to_a_name_that_fits_exactly_in_sixty_thre
 (1 row)
 
 DROP TABLE public.renamed_to_a_name_that_fits_exactly_in_sixty_three_bytes_;
--- ============================================================
--- Test 65: a partition trigger that will not fire is not counted
--- ============================================================
--- The root's TRUNCATE trigger counts the descendants' triggers that will
--- follow in the statement. One in state 'R' (ENABLE REPLICA) under the
--- default replication role does not fire, so the count never reached zero
--- and a later TRUNCATE of a sibling in the same transaction consumed the
--- leftover instead of being recorded. sync_partition_triggers() resets the
--- state on any DDL of the tree, so the state is forced through the catalog.
-CREATE TABLE public.test_tgstate (id int) PARTITION BY RANGE (id);
-CREATE TABLE public.test_tgstate_p1 PARTITION OF public.test_tgstate FOR VALUES FROM (0) TO (10);
-CREATE TABLE public.test_tgstate_p2 PARTITION OF public.test_tgstate FOR VALUES FROM (10) TO (20);
-SELECT pgaudix.enable('public.test_tgstate');
- enable 
---------
- 
-(1 row)
-
-UPDATE pg_catalog.pg_trigger SET tgenabled = 'R'
-WHERE tgrelid = 'public.test_tgstate_p1'::regclass AND tgname = 'pgaudix_truncate_trigger';
-BEGIN;
-    TRUNCATE public.test_tgstate;
-    TRUNCATE public.test_tgstate_p2;
-COMMIT;
-SELECT audit_operation, count(*)
-FROM public.test_tgstate_audit
-GROUP BY audit_operation;
- audit_operation | count 
------------------+-------
- T               |     2
-(1 row)
-
-SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
- pending_rows 
---------------
-            0
-(1 row)
-
--- Under replica role only 'A' and 'R' triggers fire
-UPDATE pg_catalog.pg_trigger SET tgenabled = 'O'
-WHERE tgrelid = 'public.test_tgstate_p1'::regclass AND tgname = 'pgaudix_truncate_trigger';
-SET session_replication_role = replica;
-BEGIN;
-    TRUNCATE public.test_tgstate;
-    TRUNCATE public.test_tgstate_p2;
-COMMIT;
-RESET session_replication_role;
-SELECT audit_operation, count(*)
-FROM public.test_tgstate_audit
-GROUP BY audit_operation;
- audit_operation | count 
------------------+-------
- T               |     4
-(1 row)
-
-SELECT count(*) AS pending_rows FROM pgaudix.truncate_pending;
- pending_rows 
---------------
-            0
-(1 row)
-
-SELECT pgaudix.disable('public.test_tgstate', drop_data := true);
- disable 
----------
- 
-(1 row)
-
-DROP TABLE public.test_tgstate;
 -- ============================================================
 -- Test 66: a nested audit trigger survives a plan invalidated mid-execution
 -- ============================================================

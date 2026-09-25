@@ -177,10 +177,9 @@ ALTER TABLE orders RENAME TO orders_v2;
 
 Details worth knowing:
 
-- **Type changes** are applied to the audit table with an explicit cast (`USING column::newtype`). If the audit history cannot be converted (for example `int` to `uuid`, or narrowing `text` to `varchar(3)` with longer values already logged), the audit column is converted to `text` instead and a `WARNING` is raised: history is preserved and auditing keeps working. An audit column of type `text` is never changed again.
+- **Type changes** are applied to the audit table with an explicit cast (`USING column::newtype`). If the audit history cannot be converted (for example `int` to `uuid`), the audit column is converted to `text` instead and a `WARNING` is raised: history is preserved and auditing keeps working. An audit column of type `text` is never changed again. **Narrowing a character type truncates history**: an explicit cast to `varchar(n)` / `char(n)` cuts longer values instead of failing, so `varchar(20)` → `varchar(5)` turns an audited `'Alexander'` into `'Alexa'` without a warning, even though the source's own `ALTER` only succeeds once its current values fit.
 - **Domains** are mirrored with their base type (`numeric(8,2)` for a domain over it), so `NOT NULL` or `CHECK` constraints of the domain do not reject the NULL data of `T` rows.
-- **Inheritance and partitions**: changes made through a parent table (`ALTER TABLE parent ADD COLUMN`) are synced to audited children and partitions.
-- **Partitioned tables**: every partition gets a `TRUNCATE` trigger so that truncating a partition directly is audited. Partitions created, attached or detached later, and renames of the root, are reconciled automatically. Each `TRUNCATE` writes a single `T` row, whether it names the root or one partition, and every `TRUNCATE` is recorded, also when several run inside one function or `DO` block.
+- **Every `TRUNCATE` is recorded**, also when several run inside one function or `DO` block.
 - **Generated columns**: stored generated columns are mirrored with their values. Virtual generated columns (PostgreSQL 18+) have no stored value, so their audit column is always `NULL`; derive the value from the audited columns when needed.
 - **`session_replication_role = replica`**: DML, TRUNCATE and DDL sync keep working (all triggers are `ENABLE ALWAYS`).
 
@@ -210,7 +209,7 @@ SELECT pgaudix.disable('orders', drop_data := true);
 
 | Function | Description |
 |----------|-------------|
-| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and triggers. Caller must own the table or be a superuser. |
+| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and triggers. Caller must own the table or be a superuser. Regular tables only: partitioned tables, partitions and tables that use inheritance are refused (see *Not supported*). |
 | `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. Same ownership rule. |
 | `pgaudix.status()` | List all monitored tables with integrity checks. |
 
@@ -300,16 +299,38 @@ pgaudix/
 - The `enable()` function rejects duplicate registrations
 - Direct `ALTER TABLE` on audit tables produces a warning. A column added and dropped, or a mirrored column dropped, directly on the audit table leaves a dropped slot that a later source column cannot take (attnums are never recycled); the `ALTER TABLE` that adds such a column is refused with a message explaining how to rebuild the audit table (rename it to keep its history, then `disable()` and `enable()` again)
 
+## Not supported: partitioned tables and table inheritance
+
+pgaudix audits **regular tables only**. It does not support:
+
+- **Partitioned tables** (`PARTITION BY`) and their **partitions**
+- **Table inheritance** (`INHERITS`): neither the parent nor the child tables
+
+`enable()` refuses these tables with an error (SQLSTATE `0A000`, `feature_not_supported`) and creates nothing:
+
+```sql
+SELECT pgaudix.enable('measurements');
+-- ERROR:  pgaudix: cannot audit public.measurements: partitioned tables are not supported
+SELECT pgaudix.enable('measurements_2026_01');
+-- ERROR:  pgaudix: cannot audit public.measurements_2026_01: it is a partition of public.measurements; partitioned tables are not supported
+SELECT pgaudix.enable('customer');
+-- ERROR:  pgaudix: cannot audit public.customer: it inherits from public.person; table inheritance (INHERITS) is not supported
+```
+
+An audited table cannot join one later either: `ALTER TABLE ... ATTACH PARTITION`, `ALTER TABLE ... INHERIT` and `CREATE TABLE ... INHERITS` involving an audited table are refused. Run `pgaudix.disable()` on it first.
+
+Why: a logical backup/restore (`pg_dump` / `pg_restore`) of such tables is not safe with pgaudix. A parallel `pg_restore -j` of an audited partition tree can lose the rows of a partition, `pg_restore -1` aborts, and an audited inheritance child can come back without its triggers (unaudited). Regular tables restore correctly with `pg_restore` (serial or `-j`) and with `psql`.
+
 ## Known Limitations
 
 - TRUNCATE is audited at the statement level (operation `T`) but individual row values cannot be captured (PostgreSQL limitation)
 - Source columns starting with `audit_` will work but may cause confusion when reading the audit table; the nine metadata names themselves (see `pgaudix.reserved_columns()`) are rejected
 - The audit table reserves one column slot per source attnum (dropped columns included) plus 9 metadata columns, so the source's highest attnum must be at most 1591 (PostgreSQL limit is 1600)
 - Dropping a source column drops the mirrored column and its history; dropping a source table drops its audit table (use `disable()` first to keep the data)
-- An UPDATE that moves a row between partitions is recorded as `D` + `I` (PostgreSQL fires no UPDATE trigger for it)
+- Partitioned tables and table inheritance are not supported (see above)
 - `audit_user` is `session_user`; actions performed after `SET ROLE` are attributed to the login role (use `audit_app_user` to identify the acting user)
 - The Windows build is compiled with MSYS2/mingw and tested against the MSYS2 PostgreSQL; loading it into an EDB (MSVC) installation has not been verified
-- There is no automatic retention: audit tables grow until a superuser deletes old rows (`DELETE FROM orders_audit WHERE audit_timestamp < ...`). Renaming an audit table by hand is reverted by the DDL sync on purpose; use `disable()` first if you need to move it
+- There is no automatic retention: audit tables grow until a superuser deletes old rows (`DELETE FROM orders_audit WHERE audit_timestamp < ...`). Do not rename or move an audit table by hand: the DML trigger writes to the registered name, so every `INSERT`/`UPDATE`/`DELETE` on the source fails until the audit table gets that name back. Use `disable()` first if you need to move it
 
 ## License
 
