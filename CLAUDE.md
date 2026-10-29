@@ -24,6 +24,7 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 - Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--<previous>--X.Y.Z.sql` delta; never rewrite a released script in place. `test/sql/pgaudix_upgrade.sql` checks that the upgraded catalog matches a fresh install
 - `Makefile` — PGXS build (`make USE_PGXS=1`)
 - `pgaudix.control` — Extension metadata
+- `docker/Dockerfile.release` — release image (`postgres:<major>` + installed extension) pushed to `ghcr.io/sipesistemas/pgaudix` by the release workflow; `docker/smoke-test.sh` checks `CREATE EXTENSION` against it. The root `Dockerfile` is the dev environment only
 
 ## API
 

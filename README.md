@@ -50,6 +50,48 @@ CREATE EXTENSION pgaudix;
 
 > The extension must be created once per database. To make it available in every new database, install it in `template1`.
 
+## Docker image
+
+Every release publishes the official `postgres` image (Debian) with pgaudix installed, for `linux/amd64` and `linux/arm64`:
+
+| Tag                        | Points to                                |
+|----------------------------|------------------------------------------|
+| `ghcr.io/sipesistemas/pgaudix:<version>-pg<major>` | that release, e.g. `1.0.0-pg18` |
+| `ghcr.io/sipesistemas/pgaudix:pg<major>`           | the latest release for that major |
+
+Majors: 16, 17 and 18. The image behaves exactly like `postgres:<major>` (same environment variables, entrypoint and data directory); the extension is installed but not created, so run `CREATE EXTENSION pgaudix;` in each database (or in `template1`, or from a script in `/docker-entrypoint-initdb.d/`).
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres ghcr.io/sipesistemas/pgaudix:1.0.0-pg18
+```
+
+docker-compose:
+
+```yaml
+services:
+  db:
+    image: ghcr.io/sipesistemas/pgaudix:1.0.0-pg18
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+```
+
+Testcontainers (.NET, `Testcontainers.PostgreSql`):
+
+```csharp
+var postgres = new PostgreSqlBuilder()
+    .WithImage("ghcr.io/sipesistemas/pgaudix:1.0.0-pg18")
+    .Build();
+```
+
+Pin `<version>-pg<major>` in CI and tests; `pg<major>` moves with every release. To build the image locally from a checkout:
+
+```bash
+docker build -f docker/Dockerfile.release --build-arg PG_MAJOR=18 -t pgaudix:pg18 .
+docker/smoke-test.sh pgaudix:pg18   # CREATE EXTENSION + version check
+```
+
 ## Usage
 
 ### Enable auditing on a table
@@ -292,6 +334,9 @@ The remaining cost is the INSERT into the audit table (primary key and timestamp
 pgaudix/
 ├── Dockerfile                  # Build environment (postgres:17 + build tools)
 ├── docker-compose.yml          # Dev environment on port 5433
+├── docker/
+│   ├── Dockerfile.release      # Release image (postgres:<major> + pgaudix), published to ghcr.io
+│   └── smoke-test.sh           # CREATE EXTENSION check against an image
 ├── Makefile                    # PGXS build system
 ├── pgaudix.control            # Extension metadata
 ├── pgaudix--1.1.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
