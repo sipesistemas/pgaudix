@@ -285,9 +285,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      # O build-push-action também publica registros *.dockerbuild, que não são pacotes do release
+      - name: Download package artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: pgaudix-*
           path: dist
           merge-multiple: true
 
