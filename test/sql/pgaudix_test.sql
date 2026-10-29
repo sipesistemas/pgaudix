@@ -564,7 +564,7 @@ DROP TABLE public.test_gaps;
 -- so a future GRANT TRUNCATE TO PUBLIC is reset on re-enable.
 SELECT prosrc LIKE '%REVOKE INSERT, UPDATE, DELETE, TRUNCATE%' AS revoke_includes_truncate
 FROM pg_proc
-WHERE proname = 'enable' AND pronamespace = 'pgaudix'::regnamespace;
+WHERE proname = 'enable' AND pronamespace = 'pgaudix'::regnamespace AND pronargs = 2;
 
 -- ============================================================
 -- Test 29: A4 — v_offset NULL is detected and reported
@@ -2111,6 +2111,212 @@ ORDER BY source_table;
 
 SELECT pgaudix.disable('public.test_ren_y', drop_data := true);
 DROP TABLE public.test_ren_y;
+
+-- ============================================================
+-- Test 72: enable() with audit_schema creates the audit table there
+-- ============================================================
+CREATE SCHEMA test_aud;
+CREATE TABLE public.test_pin (id int PRIMARY KEY, name text);
+
+SELECT pgaudix.enable('public.test_pin', audit_schema := 'test_aud');
+
+-- The audit table lives in test_aud only
+SELECT n.nspname, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'test_pin_audit'
+ORDER BY n.nspname;
+SELECT source_schema, source_table, audit_schema, audit_table,
+       audit_table_exists, dml_trigger_enabled, truncate_trigger_enabled
+FROM pgaudix.status()
+WHERE source_table = 'test_pin';
+
+BEGIN;
+SET LOCAL pgaudix.app_user = 'user-72';
+SET LOCAL pgaudix.app_user_ip = '203.0.113.72';
+INSERT INTO public.test_pin VALUES (1, 'a');
+UPDATE public.test_pin SET name = 'b' WHERE id = 1;
+DELETE FROM public.test_pin WHERE id = 1;
+COMMIT;
+INSERT INTO public.test_pin VALUES (2, 'c');
+TRUNCATE public.test_pin;
+SELECT audit_operation, audit_app_user, audit_app_user_ip, id, name
+FROM test_aud.test_pin_audit ORDER BY audit_id;
+
+-- audit_schema := NULL keeps the 1.0.0 behaviour (same schema as the source)
+CREATE TABLE public.test_pin_null (id int);
+SELECT pgaudix.enable('public.test_pin_null', audit_schema := NULL);
+SELECT audit_schema, audit_table FROM pgaudix.status() WHERE source_table = 'test_pin_null';
+SELECT pgaudix.disable('public.test_pin_null', drop_data := true);
+DROP TABLE public.test_pin_null;
+
+-- ============================================================
+-- Test 73: DDL sync on a source audited into another schema
+-- ============================================================
+ALTER TABLE public.test_pin ADD COLUMN qty int;
+ALTER TABLE public.test_pin RENAME COLUMN name TO title;
+ALTER TABLE public.test_pin ALTER COLUMN qty TYPE bigint;
+ALTER TABLE public.test_pin DROP COLUMN title;
+INSERT INTO public.test_pin VALUES (3, 30);
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'test_aud' AND table_name = 'test_pin_audit'
+  AND column_name NOT LIKE 'audit\_%'
+ORDER BY ordinal_position;
+SELECT audit_operation, id, qty FROM test_aud.test_pin_audit
+WHERE audit_operation = 'I' AND id = 3;
+
+-- ============================================================
+-- Test 74: RENAME of the source renames the audit table inside its schema
+-- ============================================================
+ALTER TABLE public.test_pin RENAME TO test_pin2;
+SELECT n.nspname, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname LIKE 'test\_pin%\_audit'
+ORDER BY n.nspname, c.relname;
+INSERT INTO public.test_pin2 VALUES (4, 40);
+SELECT audit_operation, id FROM test_aud.test_pin2_audit WHERE id = 4;
+SELECT source_schema, source_table, audit_schema, audit_table, dml_trigger_enabled
+FROM pgaudix.status() WHERE source_table = 'test_pin2';
+
+-- ============================================================
+-- Test 75: SET SCHEMA of the source leaves the audit table where it is
+-- ============================================================
+CREATE SCHEMA test_src;
+ALTER TABLE public.test_pin2 SET SCHEMA test_src;
+SELECT n.nspname, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'test_pin2_audit';
+INSERT INTO test_src.test_pin2 VALUES (5, 50);
+SELECT audit_operation, id FROM test_aud.test_pin2_audit WHERE id = 5;
+SELECT source_schema, source_table, audit_schema, audit_table, dml_trigger_enabled
+FROM pgaudix.status() WHERE source_table = 'test_pin2';
+
+-- ============================================================
+-- Test 76: renaming the source's schema does not move the audit table
+-- ============================================================
+ALTER SCHEMA test_src RENAME TO test_src2;
+INSERT INTO test_src2.test_pin2 VALUES (6, 60);
+SELECT audit_operation, id FROM test_aud.test_pin2_audit WHERE id = 6;
+SELECT source_schema, source_table, audit_schema, audit_table, dml_trigger_enabled
+FROM pgaudix.status() WHERE source_table = 'test_pin2';
+
+-- ============================================================
+-- Test 77: renaming the audit schema keeps auditing working
+-- ============================================================
+ALTER SCHEMA test_aud RENAME TO test_aud2;
+INSERT INTO test_src2.test_pin2 VALUES (7, 70);
+SELECT audit_operation, id FROM test_aud2.test_pin2_audit WHERE id = 7;
+SELECT source_schema, source_table, audit_schema, audit_table, dml_trigger_enabled
+FROM pgaudix.status() WHERE source_table = 'test_pin2';
+ALTER SCHEMA test_aud2 RENAME TO test_aud;
+INSERT INTO test_src2.test_pin2 VALUES (8, 80);
+SELECT audit_operation, id FROM test_aud.test_pin2_audit WHERE id = 8;
+
+-- ============================================================
+-- Test 78: one audit schema, two sources with the same name
+-- ============================================================
+CREATE TABLE public.test_pin2 (id int);
+SELECT pgaudix.enable('public.test_pin2', audit_schema := 'test_aud');
+-- Renaming onto a name whose audit table is taken is refused too
+CREATE TABLE public.test_pin3 (id int);
+SELECT pgaudix.enable('public.test_pin3', audit_schema := 'test_aud');
+ALTER TABLE test_src2.test_pin2 RENAME TO test_pin3;
+ALTER TABLE public.test_pin3 RENAME TO test_pin2_x;
+ALTER TABLE test_src2.test_pin2 RENAME TO test_pin3;
+SELECT source_schema, source_table, audit_schema, audit_table
+FROM pgaudix.status() WHERE source_table LIKE 'test\_pin%' ORDER BY 1, 2;
+SELECT pgaudix.disable('public.test_pin2_x', drop_data := true);
+DROP TABLE public.test_pin2, public.test_pin2_x;
+
+-- ============================================================
+-- Test 79: the audit schema is validated
+-- ============================================================
+CREATE TABLE public.test_pin_bad (id int);
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'test_nope');
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'pgaudix');
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'pg_catalog');
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'information_schema');
+
+-- A table owner needs CREATE on the audit schema to put its log there
+CREATE ROLE pgaudix_test_pin_owner;
+GRANT USAGE ON SCHEMA pgaudix TO pgaudix_test_pin_owner;
+GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass, name),
+                          pgaudix.disable(regclass, boolean) TO pgaudix_test_pin_owner;
+ALTER TABLE public.test_pin_bad OWNER TO pgaudix_test_pin_owner;
+SET ROLE pgaudix_test_pin_owner;
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'test_aud');
+RESET ROLE;
+GRANT CREATE ON SCHEMA test_aud TO pgaudix_test_pin_owner;
+SET ROLE pgaudix_test_pin_owner;
+SELECT pgaudix.enable('public.test_pin_bad', audit_schema := 'test_aud');
+SELECT pgaudix.disable('public.test_pin_bad', drop_data := true);
+RESET ROLE;
+
+-- The one-argument enable() still works with only its own grant
+GRANT USAGE, CREATE ON SCHEMA public TO pgaudix_test_pin_owner;
+REVOKE EXECUTE ON FUNCTION pgaudix.enable(regclass, name) FROM pgaudix_test_pin_owner;
+GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass) TO pgaudix_test_pin_owner;
+SET ROLE pgaudix_test_pin_owner;
+SELECT pgaudix.enable('public.test_pin_bad');
+SELECT pgaudix.disable('public.test_pin_bad', drop_data := true);
+RESET ROLE;
+DROP TABLE public.test_pin_bad;
+REVOKE ALL ON SCHEMA test_aud, public, pgaudix FROM pgaudix_test_pin_owner;
+REVOKE ALL ON FUNCTION pgaudix.enable(regclass), pgaudix.disable(regclass, boolean)
+    FROM pgaudix_test_pin_owner;
+DROP ROLE pgaudix_test_pin_owner;
+
+-- ============================================================
+-- Test 80: disable() and DROP with the audit table in another schema
+-- ============================================================
+SELECT pgaudix.disable('test_src2.test_pin3');
+SELECT count(*) > 0 AS history_kept FROM test_aud.test_pin3_audit;
+DROP TABLE test_aud.test_pin3_audit;
+
+SELECT pgaudix.enable('test_src2.test_pin3', audit_schema := 'test_aud');
+SELECT pgaudix.disable('test_src2.test_pin3', drop_data := true);
+SELECT to_regclass('test_aud.test_pin3_audit') IS NULL AS audit_dropped;
+
+SELECT pgaudix.enable('test_src2.test_pin3', audit_schema := 'test_aud');
+DROP TABLE test_src2.test_pin3;
+SELECT to_regclass('test_aud.test_pin3_audit') IS NULL AS audit_dropped_with_source;
+SELECT count(*) FROM pgaudix.monitored_tables WHERE source_table LIKE 'test\_pin%';
+
+DROP SCHEMA test_src2;
+DROP SCHEMA test_aud;
+
+-- ============================================================
+-- Test 81: renaming or moving an audit table by hand
+-- ============================================================
+-- The DML trigger writes to the registered audit table, so DDL sync keeps
+-- the audit table where the registration says it is: a renamed audit table
+-- gets its name back, and one that follows its source goes back to the
+-- source's schema. A pinned audit table may change schema.
+CREATE SCHEMA test_hand;
+CREATE TABLE public.test_hand_f (id int);
+SELECT pgaudix.enable('public.test_hand_f');
+ALTER TABLE public.test_hand_f_audit RENAME TO test_hand_f_log;
+ALTER TABLE public.test_hand_f_audit SET SCHEMA test_hand;
+INSERT INTO public.test_hand_f VALUES (1);
+SELECT n.nspname, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname LIKE 'test\_hand\_f\_%' ORDER BY 1, 2;
+SELECT audit_operation, id FROM public.test_hand_f_audit;
+
+CREATE SCHEMA test_hand_aud;
+CREATE TABLE public.test_hand_p (id int);
+SELECT pgaudix.enable('public.test_hand_p', audit_schema := 'test_hand_aud');
+ALTER TABLE test_hand_aud.test_hand_p_audit RENAME TO test_hand_p_log;
+ALTER TABLE test_hand_aud.test_hand_p_audit SET SCHEMA test_hand;
+INSERT INTO public.test_hand_p VALUES (1);
+SELECT source_table, audit_schema, audit_table, dml_trigger_enabled
+FROM pgaudix.status() WHERE source_table LIKE 'test\_hand\_%' ORDER BY 1;
+SELECT audit_operation, id FROM test_hand.test_hand_p_audit;
+
+SELECT pgaudix.disable('public.test_hand_f', drop_data := true);
+SELECT pgaudix.disable('public.test_hand_p', drop_data := true);
+DROP TABLE public.test_hand_f, public.test_hand_p;
+DROP SCHEMA test_hand, test_hand_aud;
 
 -- Re-create test_orders for final cleanup block
 CREATE TABLE public.test_orders (

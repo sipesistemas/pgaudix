@@ -2,10 +2,10 @@ EXTENSION    = pgaudix
 MODULE_big   = pgaudix
 OBJS         = src/pgaudix.o
 
-DATA         = pgaudix--1.0.0.sql
+DATA         = pgaudix--1.0.0.sql pgaudix--1.1.0.sql pgaudix--1.0.0--1.1.0.sql
 PGFILEDESC   = "pgaudix - automatic table auditing with column mirroring"
 
-REGRESS      = pgaudix_test
+REGRESS      = pgaudix_test pgaudix_upgrade
 REGRESS_OPTS = --inputdir=test
 
 PG_CPPFLAGS  = -I$(srcdir)/src
