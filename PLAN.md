@@ -47,9 +47,9 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - Uses parameterized `SPI_execute_with_args()` with error checking
 - `SECURITY DEFINER` with `SET search_path` for audit table write access
 
-### SQL install script (`pgaudix--1.0.0.sql`)
+### SQL install script (`pgaudix--1.1.0.sql`)
 - `pgaudix.monitored_tables` — registration table with `source_oid` for OID-based lookup
-- `pgaudix.enable(regclass)` — creates audit table (with attnum gap alignment), triggers, registration. Serialized with LOCK TABLE.
+- `pgaudix.enable(regclass, name)` — creates audit table (with attnum gap alignment) in the source's schema or in the given audit schema, triggers, registration. Serialized with LOCK TABLE. `enable(regclass)` calls it with NULL.
 - `pgaudix.disable(regclass, bool)` — drops triggers, optionally drops audit table
 - `pgaudix.status()` — lists monitored tables
 - `pgaudix.truncate_trigger()` — PL/pgSQL AFTER TRUNCATE trigger (statement-level)
@@ -65,7 +65,7 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 - `enable()` serialized with `LOCK TABLE ... IN EXCLUSIVE MODE`
 - `audit_user` uses `session_user` (not `current_user`) for authentic identity
 
-## Test Cases (66 tests + PG18-only virtual generated columns file)
+## Test Cases (76 tests, an upgrade test file and a PG18-only virtual generated columns file)
 
 1. Enable auditing
 2. INSERT audit
@@ -133,3 +133,18 @@ CREATE INDEX ON public.orders_audit (audit_timestamp);
 64. RENAME TABLE to a name whose audit name would overflow NAMEDATALEN is rejected
 65. Partition triggers that will not fire under the replication role are not counted
 66. A nested audit trigger survives a plan invalidated mid-execution
+67. A dropped slot in the audit table must not swallow a new column
+68. Dropping an unrelated table must not remove an orphan's audit table
+69. RENAME onto an orphan's name must not hand the table to the orphan
+72. enable() with audit_schema creates the audit table there (NULL keeps the 1.0.0 behaviour)
+73. DDL sync on a source audited into another schema
+74. RENAME of the source renames the audit table inside its schema
+75. SET SCHEMA of the source leaves a pinned audit table where it is
+76. Renaming the source's schema does not move a pinned audit table
+77. Renaming the audit schema keeps auditing working
+78. Two sources with the same name cannot share an audit schema (enable, RENAME)
+79. The audit schema is validated (existence, system schemas, CREATE privilege); one-argument enable() grants keep working
+80. disable() and DROP with the audit table in another schema
+81. An audit table renamed or moved by hand is put back (or followed, when pinned)
+
+`test/sql/pgaudix_upgrade.sql`: ALTER EXTENSION UPDATE from 1.0.0 keeps registrations and GRANTs, and leaves the same catalog as a fresh 1.1.0 install.

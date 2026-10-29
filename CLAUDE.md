@@ -19,14 +19,16 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 ## Key Files
 
 - `src/pgaudix.c` — C DML trigger function using SPI
-- `pgaudix--1.0.0.sql` — full SQL install script for fresh installs (current version)
-- Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--1.0.0--X.Y.Z.sql` delta; never rewrite a released script in place
+- `pgaudix--1.1.0.sql` — full SQL install script for fresh installs (current version)
+- `pgaudix--1.0.0--1.1.0.sql` — upgrade delta; `pgaudix--1.0.0.sql` is the previous release, kept as is
+- Future versions: ship a full `pgaudix--X.Y.Z.sql` plus a `pgaudix--<previous>--X.Y.Z.sql` delta; never rewrite a released script in place. `test/sql/pgaudix_upgrade.sql` checks that the upgraded catalog matches a fresh install
 - `Makefile` — PGXS build (`make USE_PGXS=1`)
 - `pgaudix.control` — Extension metadata
 
 ## API
 
-- `pgaudix.enable(target_table regclass)` — Start auditing a table (creates `_audit` table + trigger)
+- `pgaudix.enable(target_table regclass)` — Start auditing a table (creates `_audit` table + trigger); thin wrapper over the two-argument form, kept so GRANTs on the 1.0.0 signature keep working
+- `pgaudix.enable(target_table regclass, audit_schema name)` — Same, with the audit table in `audit_schema` (`monitored_tables.audit_schema_pinned`): it stays there when the source moves (SET SCHEMA, ALTER SCHEMA RENAME), and the registration follows when the audit table's own schema is renamed. Requires CREATE on that schema for non-superusers. The DDL-sync pre-pass handles both sources and audit tables touched by a command: an unpinned audit table is kept in its source's schema, a pinned one where it is, and both keep the name derived from the source
 - `pgaudix.disable(target_table regclass, drop_data bool DEFAULT false)` — Stop auditing
 - `pgaudix.status()` — List all monitored tables with integrity flags
 - Internal helpers (not for users): `heal_registry()`, `sync_partition_triggers()`, `audit_type()`, `check_table_owner()`, `invoker()`, `reserved_columns()` (single list of the metadata column names used by `enable()` and `ddl_sync()`), `audit_name()` (source name → audit name, rejects names that would truncate at 63 bytes; used by `enable()` and the RENAME pre-pass), `audit_tgarg()` (the force-quoted `"schema"."table"` DML trigger argument, used by `enable()`, the pre-pass and `is_source_of()`), `is_source_of(rel, audit_schema, audit_table)` (does `rel` carry our DML trigger naming that audit table; the single definition of "this relation is this registration's source")
@@ -38,7 +40,7 @@ Native C PostgreSQL extension for automatic table auditing using PGXS build syst
 - `audit_app_user` and `audit_app_user_ip` (both `text`) come from the `pgaudix.app_user` / `pgaudix.app_user_ip` GUCs that the application sets per transaction (`SET LOCAL`); NULL when unset (`NULLIF(..., '')`, because `current_setting(..., true)` returns `''` once the GUC was ever set in the session)
 - Mirrored columns keep their original names
 - Extension schema: `pgaudix`
-- Version: 1.0.0 (first production release; no upgrade path from the 0.x pre-releases)
+- Version: 1.1.0 (upgrade path from 1.0.0; none from the 0.x pre-releases)
 
 ## Development Environment
 

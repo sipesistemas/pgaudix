@@ -11,6 +11,7 @@ To let a non-superuser role manage auditing of its own tables:
 ```sql
 GRANT USAGE ON SCHEMA pgaudix TO app_admin;
 GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass),
+                          pgaudix.enable(regclass, name),
                           pgaudix.disable(regclass, boolean),
                           pgaudix.status() TO app_admin;
 ```
@@ -19,6 +20,18 @@ GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass),
 
 ```sql
 SELECT pgaudix.enable('my_table');
+```
+
+To keep the audit table in a schema of its own (it must exist; non-superusers need `CREATE` on it):
+
+```sql
+SELECT pgaudix.enable('my_table', audit_schema := 'audit');   -- audit.my_table_audit
+```
+
+## Upgrade
+
+```sql
+ALTER EXTENSION pgaudix UPDATE TO '1.1.0';
 ```
 
 ## Disable auditing
