@@ -81,6 +81,18 @@ This creates `orders_audit` in the same schema with:
 | `amount`            | `numeric(10,2)`          | *(mirrored from source)*        |
 | `status`            | `text`                   | *(mirrored from source)*        |
 
+### Keeping audit tables in a schema of their own
+
+By default the audit table sits next to its source. Pass `audit_schema` to create it in another schema instead, for example to keep every log in one place, apart from the application's tables:
+
+```sql
+CREATE SCHEMA audit;
+SELECT pgaudix.enable('orders', audit_schema := 'audit');
+-- creates audit.orders_audit
+```
+
+The schema must exist, and a caller that is not a superuser needs `CREATE` on it. The audit table then stays in that schema: `ALTER TABLE orders SET SCHEMA ...` and renaming the source's schema move only the source, while `ALTER SCHEMA audit RENAME ...` is followed by the registration. Renaming the source still renames its audit table. Two sources with the same table name cannot share one audit schema (the second `enable()`, or a `RENAME` onto that name, is refused).
+
 ### Identifying the application user
 
 `audit_user` is the PostgreSQL role of the connection and `audit_client_addr` is the address it came from. An application that connects with a single role (the usual SaaS setup) records that role and its own server address on every row, so it also reports the end user, and the end user's address, through session variables, once per transaction or request:
@@ -209,7 +221,8 @@ SELECT pgaudix.disable('orders', drop_data := true);
 
 | Function | Description |
 |----------|-------------|
-| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table and triggers. Caller must own the table or be a superuser. Regular tables only: partitioned tables, partitions and tables that use inheritance are refused (see *Not supported*). |
+| `pgaudix.enable(target_table regclass)` | Start auditing a table. Creates the `_audit` table in the source's schema, and triggers. Caller must own the table or be a superuser. Regular tables only: partitioned tables, partitions and tables that use inheritance are refused (see *Not supported*). |
+| `pgaudix.enable(target_table regclass, audit_schema name)` | Same, with the audit table created in `audit_schema`, where it stays (see *Keeping audit tables in a schema of their own*). `NULL` behaves like the one-argument form. The caller also needs `CREATE` on `audit_schema`. |
 | `pgaudix.disable(target_table regclass, drop_data boolean DEFAULT false)` | Stop auditing. Optionally drops the audit table. Same ownership rule. |
 | `pgaudix.status()` | List all monitored tables with integrity checks. |
 
@@ -220,11 +233,22 @@ SELECT pgaudix.disable('orders', drop_data := true);
 ```sql
 GRANT USAGE ON SCHEMA pgaudix TO app_admin;
 GRANT EXECUTE ON FUNCTION pgaudix.enable(regclass),
+                          pgaudix.enable(regclass, name),
                           pgaudix.disable(regclass, boolean),
                           pgaudix.status() TO app_admin;
 ```
 
 Audit tables are owned by the extension owner. Grant `SELECT` on `<table>_audit` explicitly to whoever needs to read the log.
+
+### Upgrading
+
+Install the new release files and run, in each database that has the extension:
+
+```sql
+ALTER EXTENSION pgaudix UPDATE TO '1.1.0';
+```
+
+Existing registrations keep their audit tables next to their sources, and GRANTs on `enable(regclass)` are kept. `enable(regclass, name)` is new, so grant it separately.
 
 ### Backup and restore
 
@@ -270,7 +294,9 @@ pgaudix/
 ├── docker-compose.yml          # Dev environment on port 5433
 ├── Makefile                    # PGXS build system
 ├── pgaudix.control            # Extension metadata
-├── pgaudix--1.0.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── pgaudix--1.1.0.sql         # SQL install script (PL/pgSQL functions, event triggers)
+├── pgaudix--1.0.0--1.1.0.sql  # Upgrade script from 1.0.0
+├── pgaudix--1.0.0.sql         # Install script of the previous release (kept, never edited)
 ├── install.sh / install.bat   # Install a release build (Linux/macOS, Windows)
 ├── src/
 │   ├── pgaudix.h              # Constants and declarations
@@ -279,9 +305,11 @@ pgaudix/
 │   ├── bench.sql                   # Benchmark (make bench)
 │   ├── sql/
 │   │   ├── pgaudix_test.sql        # Regression test input
+│   │   ├── pgaudix_upgrade.sql     # ALTER EXTENSION UPDATE from 1.0.0
 │   │   └── pgaudix_generated.sql   # PostgreSQL 18+ only (virtual generated columns)
 │   └── expected/
 │       ├── pgaudix_test.out
+│       ├── pgaudix_upgrade.out
 │       └── pgaudix_generated.out
 └── .github/workflows/          # CI (tests on PG 16/17/18) and release builds
 ```
@@ -290,6 +318,7 @@ pgaudix/
 
 - All functions use `SECURITY DEFINER` with `SET search_path = pgaudix, pg_catalog, pg_temp` (`pg_temp` last, so temporary objects cannot shadow types or functions)
 - No function is executable by `PUBLIC`; `enable()` and `disable()` also require the caller to own the target table (see *Privileges*)
+- `enable()` with `audit_schema` also requires `CREATE` on that schema: the audit table is created by the extension owner, so without this check a table owner could place its log in any schema
 - The trigger functions cannot be attached to other tables by non-superusers, so audit rows cannot be forged
 - The C trigger function validates its arguments against injection attacks
 - Audit tables are protected: `INSERT`, `UPDATE`, `DELETE` and `TRUNCATE` are revoked from `PUBLIC` — only the trigger (running as `SECURITY DEFINER`) can write audit rows
@@ -330,7 +359,7 @@ Why: a logical backup/restore (`pg_dump` / `pg_restore`) of such tables is not s
 - Partitioned tables and table inheritance are not supported (see above)
 - `audit_user` is `session_user`; actions performed after `SET ROLE` are attributed to the login role (use `audit_app_user` to identify the acting user)
 - The Windows build is compiled with MSYS2/mingw and tested against the MSYS2 PostgreSQL; loading it into an EDB (MSVC) installation has not been verified
-- There is no automatic retention: audit tables grow until a superuser deletes old rows (`DELETE FROM orders_audit WHERE audit_timestamp < ...`). Do not rename or move an audit table by hand: the DML trigger writes to the registered name, so every `INSERT`/`UPDATE`/`DELETE` on the source fails until the audit table gets that name back. Use `disable()` first if you need to move it
+- There is no automatic retention: audit tables grow until a superuser deletes old rows (`DELETE FROM orders_audit WHERE audit_timestamp < ...`). An audit table renamed by hand gets its registered name back, and one that follows its source is moved back to the source's schema (the DML trigger writes to the registered name); an audit table kept in its own schema may be moved to another schema, and the registration follows
 
 ## License
 
