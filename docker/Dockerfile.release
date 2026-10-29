@@ -1,0 +1,33 @@
+# Release image: official postgres:<major> (Debian, glibc) with pgaudix
+# installed. The dev Dockerfile at the repository root keeps the build tools
+# and the bind-mounted source; this one ships only the installed files.
+#
+#   docker build -f docker/Dockerfile.release --build-arg PG_MAJOR=18 -t pgaudix:pg18 .
+
+ARG PG_MAJOR=18
+
+FROM postgres:${PG_MAJOR} AS build
+ARG PG_MAJOR
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /pgaudix
+COPY Makefile pgaudix.control pgaudix--*.sql ./
+COPY src/ src/
+
+# Stage exactly the files PostgreSQL loads (module, control, SQL scripts)
+# under their final paths, so the runtime stage copies them with one COPY.
+RUN make USE_PGXS=1 \
+    && LIBDIR="$(pg_config --pkglibdir)" \
+    && EXTDIR="$(pg_config --sharedir)/extension" \
+    && install -D -m 755 pgaudix.so "/out${LIBDIR}/pgaudix.so" \
+    && install -D -m 644 pgaudix.control "/out${EXTDIR}/pgaudix.control" \
+    && install -m 644 pgaudix--*.sql "/out${EXTDIR}/"
+
+FROM postgres:${PG_MAJOR}
+
+COPY --from=build /out/ /
